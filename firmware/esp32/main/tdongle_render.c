@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "scene.h"
@@ -438,23 +439,87 @@ static void gift(uint8_t *out, uint32_t now)
     if ((now / 250) % 2) star(out, 76, 29, GOLD);
 }
 
+/* Raid metadata comes exclusively from the existing PokéLDN DISPLAY/LOBBY
+   command. This renderer does NOT infer game state from Wi-Fi traffic, and it
+   never claims to know a Tera type, battle outcome or Dynamax phase. */
+static const char *raid_header(const char *title)
+{
+    if (contains_ci(title, "tera") || contains_ci(title, "crystal") ||
+        contains_ci(title, "cristal")) return "TERA RAID";
+    if (contains_ci(title, "adventure") || contains_ci(title, "expedition"))
+        return "DYNAMAX ADV";
+    if (contains_ci(title, "gigantamax") || contains_ci(title, "g-max") ||
+        contains_ci(title, "gmax")) return "GMAX RAID";
+    if (contains_ci(title, "dynamax") || contains_ci(title, "max raid") ||
+        contains_ci(title, "max den")) return "MAX RAID";
+    return "RAID LOBBY";   /* Do not guess when the host title is unrecognised. */
+}
+
+static uint16_t raid_accent(const char *header)
+{
+    if (strcmp(header, "TERA RAID") == 0) return C_BLUE;
+    if (strcmp(header, "DYNAMAX ADV") == 0) return GOLD;
+    if (strcmp(header, "GMAX RAID") == 0 || strcmp(header, "MAX RAID") == 0)
+        return RED;
+    return GOLD;
+}
+
 static void raid(uint8_t *out, uint32_t now)
 {
-    header(out, "RAID");
-    if (!sprite(out, SLOT_OURS, 42, 69, 69, 43, scene_sprite_name(SLOT_OURS)))
-        ball(out, 44, 48 + (int)(now / 400 % 2), 16);
-    fill(out, 83, 34, 63, 36, NAVY);
-    fill(out, 85, 36, 59, 32, WHITE);
-    text(out, 90, 39, "PLAYERS", 1, NAVY);
-    const char number[] = {(char)('0' + scene_lobby_joined()), '/',
-                           (char)('0' + scene_lobby_seats()), '\0'};
-    text(out, 102, 49, number, 1, RED);
-    const char *code = scene_lobby_code();
-    if (code && code[0]) {
-        char cut[10] = {0};
-        for (int i = 0; i < 9 && code[i]; ++i) cut[i] = code[i];
-        text(out, 88, 60, cut, 1, NAVY);
+    const char *kind = raid_header(scene_title());
+    const uint16_t accent = raid_accent(kind);
+    fill(out, 0, 0, 160, 80, NAVY);
+    fill(out, 0, 17, 160, 48, CREAM);
+    ball(out, 11, 8, 6);
+    text(out, 25, 5, kind, 1, WHITE);
+    fill(out, 149, 3, 7, 11, accent);
+
+    /* One-bit sprite pixels are rendered exactly as in v0.6 trades. */
+    fill(out, 4, 20, 64, 43, NAVY);
+    border(out, 4, 20, 64, 43, accent);
+    if (!sprite_v01(out, SLOT_OURS, 6, 22, 60, 39))
+        ball(out, 36, 41 + (int)(now / 650 % 2), 12);
+
+    fill(out, 72, 20, 84, 43, NAVY);
+    border(out, 72, 20, 84, 43, GOLD);
+    const uint8_t stars = scene_lobby_stars();
+    if (stars) {
+        for (int i = 0; i < stars && i < 7; ++i)
+            star(out, 81 + i * 11, 29, GOLD);
+    } else {
+        text(out, 79, 26, "LOBBY OPEN", 1, GOLD);
     }
+    text(out, 79, 38, "GUESTS", 1, WHITE);
+    char guests[8];
+    (void)snprintf(guests, sizeof(guests), "%u/%u",
+                   (unsigned)scene_lobby_joined(),
+                   (unsigned)scene_lobby_seats());
+    text(out, 131, 38, guests, 1, GOLD);
+
+    const char *code = scene_lobby_code();
+    if (code && *code) {
+        text(out, 79, 46, "CODE", 1, GOLD);
+        char shown[13] = {0};
+        for (int i = 0; i < 12 && code[i]; ++i) shown[i] = code[i];
+        text(out, 79, 55, shown, 1, WHITE);
+    } else {
+        text(out, 79, 50, "WAITING...", 1, WHITE);
+    }
+
+    /* Full-width species label fits up to 19 characters, unlike the
+       cramped v0.6 raid panel. Longer names scroll slowly by one glyph. */
+    text(out, 6, 69, "BOSS", 1, GOLD);
+    const char *name = scene_label();
+    if (!name || !*name) name = scene_sprite_name(SLOT_OURS);
+    if (!name || !*name) name = "UNKNOWN";
+    const int count = (int)strlen(name);
+    const int visible = 19;
+    const int offset = count > visible ? (int)(now / 1300 % (uint32_t)(count - visible + 1)) : 0;
+    char shown[20];
+    int j = 0;
+    while (j < visible && name[offset + j]) { shown[j] = name[offset + j]; ++j; }
+    shown[j] = 0;
+    text(out, 39, 69, shown, 1, WHITE);
 }
 
 static void received(uint8_t *out, const scene_visual_t *v, uint32_t now)

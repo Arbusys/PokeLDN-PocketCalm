@@ -1,5 +1,5 @@
 <#
-  PokéLDN T-Dongle S3 Pocket Calm v0.6 - Windows build/flash helper.
+  PokéLDN T-Dongle S3 Pocket Calm v0.7 - Windows build/flash helper.
   Run this script from the ESP-IDF v6.1 PowerShell shortcut.
 
   Build:   .\build_tdongle_windows.ps1

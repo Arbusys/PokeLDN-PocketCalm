@@ -1,4 +1,4 @@
-# PokéLDN Pocket Calm — T-Dongle S3, v0.6
+# PokéLDN Pocket Calm — T-Dongle S3, v0.7 — Raid Lobby Edition
 
 ![Display preview](tdongle_screens.png)
 
@@ -8,12 +8,12 @@
 
 ## Download and install (Windows 10/11, x64)
 
-Download **`PokeLDN-PocketCalm-v0.6-Installer.exe`** from the [GitHub Releases](../../releases/latest) section (or from the workflow's **Artifacts** if a Release hasn't been published yet). Do not download the source ZIP if you just want to install the firmware.
+Download **`PokeLDN-PocketCalm-v0.7-Installer.exe`** from the [GitHub Releases](../../releases/latest) section (or from the workflow's **Artifacts** if a Release hasn't been published yet). Do not download the source ZIP if you just want to install the firmware.
 
 1. Connect the original **LILYGO T-Dongle S3** to your Windows PC.
 2. **Close PokéLDN** and other programs using the dongle's serial port.
 3. Open the EXE. Click **Detect ports**, or type the port seen under *Device Manager → Ports (COM & LPT)*.
-4. Check that the device is the correct board, then click **Install v0.6** and confirm.
+4. Check that the device is the correct board, then click **Install v0.7** and confirm.
 5. Do not disconnect USB or close the installer until it says **Firmware installed successfully!**.
 6. Unplug/reconnect the dongle and start PokéLDN again.
 
@@ -27,6 +27,11 @@ Install the relevant Windows USB driver if required, then look in **Device Manag
 
 ### Features
 
+- **NEW v0.7: hosted raid lobby screens**, using the existing PokéLDN `DISPLAY/LOBBY` and `DISPLAY/JOINED` messages. When the host provides a recognisable lobby title, the top bar displays **TERA RAID**, **MAX RAID**, **GMAX RAID** or **DYNAMAX ADV**; otherwise it safely displays **RAID LOBBY**.
+- Raid screen shows the **existing one-bit boss sprite**, full boss name (scrolls if too long), **star rating** (when provided), **guest count** and **Link Code** (when provided). Updates guest count in place.
+- **No changes at all to PokéLDN on Windows**: no new commands, USB messages, radio behaviour or LED behaviour. Raid UI appears **only if the stock application sends LOBBY**. If you see the home screen during a raid, the host may not have sent a screen event; the firmware cannot manufacture raid information.
+- Gigantamax cannot be distinguished from a normal Max Raid from the stock sprite metadata alone. `GMAX RAID` appears only when the supplied title actually includes Gigantamax/GMax. Likewise, Tera type, raid timer, lobby ready flags, victory and battle phases are **not** available through the stock screen messages.
+
 - Familiar handheld-inspired UI, in **English**.
 - High-contrast **monochrome Pokémon sprites** during trades, matching v0.1-style source pixels.
 - Two Pokémon appear at the sides with a **flying Poké Ball** animation at the center.
@@ -39,8 +44,8 @@ This repository intentionally contains **no precompiled firmware**: GitHub Actio
 
 1. Push all files to a public GitHub repository (include `.github/workflows/build-windows-installer.yml`).
 2. Open **Actions → Build portable Windows firmware installer → Run workflow**. Pushing to `main` triggers it automatically too.
-3. Wait for the **build** job to succeed. Download the artifact `PocketCalm-v0.6-Windows-Installer` to obtain the complete `.exe`.
-4. To publish it under **Releases**, create a tag like `v0.6.0` and push it: the workflow also creates the release entry and attaches the EXE.
+3. Wait for the **build** job to succeed. Download the artifact `PocketCalm-v0.7-Windows-Installer` to obtain the complete `.exe`.
+4. To publish it under **Releases**, create a tag like `v0.7.0` and push it: the workflow also creates the release entry and attaches the EXE.
 
 The CI job:
 
@@ -51,7 +56,7 @@ The CI job:
 - cross-compiles the installer using Go with **no third-party Go dependencies**;
 - uploads the Windows EXE as a downloadable artifact and, for version tags, a GitHub Release.
 
-The GitHub Action has been prepared but **has not yet been run in a live GitHub repository**. Please run it and check its build logs before telling others the release is ready.
+GitHub Actions builds and bundles the firmware and installer. The previous v0.6 pipeline has been validated by the project owner; **this new v0.7 build and raid display still need testing in GitHub Actions and on the real T-Dongle S3** before a public Release.
 
 ### Firmware build from an ESP-IDF v6.1 terminal
 
@@ -74,8 +79,20 @@ The firmware displays monochrome sprite data received from PokéLDN. This reposi
 
 ## Theme lab (no flashing required)
 
-Open `theme-lab.html` locally in any browser to compare **five palettes** across Home, Trade and Received screens: Classic v0.6, Modern Minimal, Game Boy Color, Crimson Ruby and Ocean Teal. These images are recoloured directly from the existing v0.6 display renders, preserving the 160×80 geometry and sprite pixels. They are **previews only**, not firmware files.
+Open `theme-lab.html` locally in any browser to compare **five palettes** across Home, Trade and Received screens: Classic v0.6, Modern Minimal, Game Boy Color, Crimson Ruby and Ocean Teal. These images are recoloured directly from the original v0.6 display renders, preserving the 160×80 geometry and sprite pixels. They are **previews only**, not firmware files.
 
 ## Next design experiments
 
-The public v0.6 is a stable baseline. UI theme experiments should remain on development branches, with USB protocol and radio features unchanged, until they have been tested on the physical display.
+The public v0.6 is the tested rollback baseline; v0.7 adds only the raid view. UI theme experiments should remain on development branches, with USB protocol and radio features unchanged, until they have been tested on the physical display.
+
+## Raid screen preview and regression checks
+
+`raid_screens_v07.png` shows enlarged **actual 160×80 frames** generated from the firmware renderer with **synthetic test sprites** and example raid messages. They are demonstrations, not screenshots of the real games or live raid data.
+
+Developers with GCC and Pillow can re-run the preview and LOBBY/JOINED scenarios:
+
+```bash
+python3 tools/render_raid_previews.py
+```
+
+The trade renderer has also been compared byte-for-byte against the original v0.6 source with identical synthetic inputs and produced an identical frame. ESP-IDF compilation and hardware tests remain necessary.

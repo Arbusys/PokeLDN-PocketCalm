@@ -726,6 +726,7 @@ const char *scene_sprite_name(uint8_t slot)
 const char *scene_lobby_code(void) { return s.lobby.code; }
 uint8_t scene_lobby_joined(void) { return s.lobby.joined; }
 uint8_t scene_lobby_seats(void) { return s.lobby.seats; }
+uint8_t scene_lobby_stars(void) { return s.lobby.stars; }
 
 const uint8_t *scene_sprite_bits(uint8_t slot, uint8_t *width, uint8_t *height)
 {

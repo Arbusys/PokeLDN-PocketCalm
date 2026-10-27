@@ -65,3 +65,4 @@ const char *scene_sprite_name(uint8_t slot);
 const char *scene_lobby_code(void);
 uint8_t scene_lobby_joined(void);
 uint8_t scene_lobby_seats(void);
+uint8_t scene_lobby_stars(void);
