@@ -1,0 +1,1142 @@
+/* pokeldn radio: an ESP32 as the LDN radio of a host on USB serial. LDN has no 4-way handshake:
+   the host derives the CCMP key and the board installs it. Message set: docs/hardware_esp32.md. */
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
+#include "esp_event.h"
+#include "esp_heap_caps.h"
+#include "esp_mac.h"
+#include "esp_private/wifi.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+
+#include "beacon.h"
+#include "display.h"
+#include "gift.h"
+#include "led.h"
+#include "private_wifi.h"
+#include "usbwatch.h"
+#include "ble.h"
+#include "wire.h"
+
+#define PROTOCOL_VERSION 1
+
+enum {
+    CMD_HELLO = 0x01, CMD_BAUD = 0x02, CMD_CHANNEL = 0x03, CMD_STA_JOIN = 0x04, CMD_STOP = 0x05,
+    CMD_AP_START = 0x06, CMD_AP_KICK = 0x07, CMD_ETH_TX = 0x08, CMD_RAW_TX = 0x09,
+    CMD_SNIFF = 0x0A, CMD_STATUS = 0x0B, CMD_BENCH = 0x0C, CMD_LED = 0x0D, CMD_DISPLAY = 0x0E,
+    CMD_ALIVE = 0x0F, CMD_BEACON = 0x10,
+};
+/* A host that sent CMD_ALIVE and then nothing for this long is gone: the board leaves the network,
+   so the console does not keep a seat nobody answers. docs/hardware_esp32.md, The host watchdog. */
+#define HOST_SILENT_US 5000000
+enum {
+    MSG_INFO = 0x81, MSG_RESULT = 0x82, MSG_RX_MGMT = 0x84, MSG_RX_ETH = 0x85, MSG_LINK = 0x86,
+    MSG_STA_JOINED = 0x87, MSG_STA_LEFT = 0x88, MSG_STATUS = 0x89, MSG_BENCH = 0x8A,
+    MSG_RX_SNIFF = 0x8C, MSG_TX_DONE = 0x8D, MSG_BUTTON = 0x8E, MSG_RX_CENSUS = 0x8F,
+    MSG_BEACON = 0x90,
+};
+enum { AP_FLAG_STOCK_JOIN = 1, AP_FLAG_NO_QOS = 2, AP_FLAG_NO_DATA_TRACE = 4, AP_FLAG_LONG_BEACON = 0x40,
+       AP_FLAG_NO_PROMISC = 0x80 };
+enum { AP_FLAG2_NO_NOISE_CHECK = 1, AP_FLAG2_NOISE_250 = 2, AP_FLAG2_RX_TIME = 4, AP_FLAG2_RETRY_7_4 = 8,
+       AP_FLAG2_CENSUS = 0x10 };
+static uint8_t s_ap_flags2;
+/* Flag bits 3..5 pin the AP's data rate: 0 leaves rate control on. docs/hardware_esp32.md */
+#define AP_FLAG_RATE(flags) (((flags) >> 3) & 7)
+static const wifi_phy_rate_t AP_FIXED_RATES[8] = {
+    0, WIFI_PHY_RATE_1M_L, WIFI_PHY_RATE_11M_L, WIFI_PHY_RATE_6M, WIFI_PHY_RATE_12M,
+    WIFI_PHY_RATE_24M, WIFI_PHY_RATE_36M, WIFI_PHY_RATE_54M,
+};
+enum mode { MODE_IDLE, MODE_STA_JOINING, MODE_STA, MODE_AP, MODE_SNIFF };
+
+static const uint8_t BROADCAST[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+static const uint8_t LDN_ACTION[4] = {0x7f, 0x00, 0x22, 0xaa};
+
+/* The RSN element a Switch station sends: CCMP, PSK, capabilities 0x000c. */
+static uint8_t s_rsn_ie[] = {
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x0c, 0x00,
+};
+
+static _Atomic enum mode s_mode = MODE_IDLE;
+static uint8_t s_key[16], s_peer[6], s_sta_mac[6], s_sniff_mac[6];
+static bool s_census;   /* SNIFF with MAC ff:ff:ff:ff:ff:ff: every frame, FCS failures too */
+static uint8_t s_ap_flags;
+static int64_t s_join_started;
+static atomic_bool s_assoc_seen;
+static atomic_uint s_rx_mgmt, s_rx_eth, s_tx_eth, s_tx_eth_failed, s_tx_raw, s_tx_raw_failed;
+static atomic_uint s_tx_acked, s_tx_unacked;
+static atomic_uint s_rx_sniff;   /* frames RX_SNIFF carried: the LED's activity while sniffing */
+static atomic_int s_ap_stations;
+static atomic_uint s_presses;   /* BOOT presses: each wakes the screen */
+static atomic_uint s_led_alarm;   /* a join that failed or a key refused: the LED's warning */
+static atomic_uint s_tx_eth_retried;   /* ETH_TX calls that found the driver's queue full */
+static atomic_int s_tx_eth_last_err;
+/* ETH_TX's own time in the driver: the handler maximum in STATUS covers every command type. */
+static atomic_uint s_tx_eth_max_us, s_tx_eth_total_us, s_tx_eth_slow;
+/* When each accepted ETH_TX entered the driver, matched in order to the driver's TX-done of a data
+   frame: the time a frame waits in the Wi-Fi queue and on the air. docs/hardware_esp32.md. */
+#define TX_RING 256
+static uint32_t s_tx_handed[TX_RING];
+static atomic_uint s_tx_handed_head, s_tx_handed_tail;
+static atomic_uint s_tx_queued_max_us, s_tx_queued_total_us, s_tx_queued_n;
+static QueueHandle_t s_ap_joins;   /* station MACs whose association response went out */
+static int s_ap_pairwise;
+static int (*s_stock_sta_connect)(uint8_t *bssid);
+static bool (*s_stock_ap_join)(priv_join_param_t *join);
+
+static void result(uint8_t command, int32_t code)
+{
+    uint8_t head[5] = {command};
+    memcpy(head + 1, &code, 4);
+    wire_send(MSG_RESULT, head, sizeof(head), NULL, 0);
+}
+
+static wifi_interface_t current_interface(void)
+{
+    return atomic_load(&s_mode) == MODE_AP ? WIFI_IF_AP : WIFI_IF_STA;
+}
+
+/* The PHY byte pair of RX_SNIFF and RX_CENSUS: sig_mode (0 legacy, 1 HT, 3 VHT), then mcs|cwb<<7.
+   An HE chip reports cur_bb_format and the HT-SIG instead (esp_wifi_he_types.h); its rate field
+   is the L-SIG rate code for an OFDM frame. docs/hardware_esp32.md, Supported boards. */
+static uint8_t rx_sig_mode(const wifi_pkt_rx_ctrl_t *c)
+{
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    return c->cur_bb_format == RX_BB_FORMAT_HT ? 1 : c->cur_bb_format == RX_BB_FORMAT_VHT ? 3 : 0;
+#else
+    return c->sig_mode;
+#endif
+}
+
+static uint8_t rx_mcs_cwb(const wifi_pkt_rx_ctrl_t *c)
+{
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    return c->cur_bb_format == RX_BB_FORMAT_HT ? (c->he_siga1 & 0x7f) | (c->he_siga1 & 0x80) : 0;
+#else
+    return c->mcs | (c->cwb << 7);
+#endif
+}
+
+/* Census: u32 receive time, i8 RSSI, i8 noise floor, u8 rx_state (0 good), u8 packet type,
+   u8 sig_mode, u8 rate, u8 mcs|cwb<<7, u16 sig_len, then the frame's first 16 bytes. */
+static void census_send(const wifi_promiscuous_pkt_t *packet, wifi_promiscuous_pkt_type_t type)
+{
+    const wifi_pkt_rx_ctrl_t *c = &packet->rx_ctrl;
+    const uint32_t stamp = c->timestamp;
+    const uint16_t sig_len = c->sig_len;
+    uint8_t head[13];
+    memcpy(head, &stamp, 4);
+    head[4] = (uint8_t)c->rssi; head[5] = (uint8_t)c->noise_floor; head[6] = c->rx_state;
+    head[7] = (uint8_t)type; head[8] = rx_sig_mode(c); head[9] = c->rate;
+    head[10] = rx_mcs_cwb(c);
+    memcpy(head + 11, &sig_len, 2);
+    atomic_fetch_add(&s_rx_sniff, 1);
+    wire_send(MSG_RX_CENSUS, head, sizeof(head), packet->payload, sig_len < 16 ? sig_len : 16);
+}
+
+/* The portable gift host's inbox (gift_run): the driver's frames and associations, in order. */
+enum { GIFT_FRAME, GIFT_AIR, GIFT_JOINED, GIFT_LEFT };
+typedef struct {
+    uint8_t kind;
+    uint16_t length;
+    uint8_t data[];
+} gift_item_t;
+static QueueHandle_t s_gift_inbox;
+static atomic_bool s_gift_on;
+
+static void gift_post(uint8_t kind, const void *data, size_t length)
+{
+    gift_item_t *item = malloc(sizeof(*item) + length);
+    if (!item) return;
+    item->kind = kind;
+    item->length = (uint16_t)length;
+    memcpy(item->data, data, length);
+    if (xQueueSend(s_gift_inbox, &item, 0) != pdTRUE) free(item);
+}
+
+static void promiscuous_rx(void *buffer, wifi_promiscuous_pkt_type_t type)
+{
+    const wifi_promiscuous_pkt_t *packet = buffer;
+    if (atomic_load(&s_mode) == MODE_SNIFF && s_census) {
+        census_send(packet, type);
+        return;
+    }
+    if (atomic_load(&s_mode) == MODE_AP && (s_ap_flags2 & AP_FLAG2_CENSUS) &&
+        (packet->rx_ctrl.rx_state || type != WIFI_PKT_DATA || packet->rx_ctrl.sig_len < 28 ||
+         memcmp(packet->payload + 4, s_peer, 6))) {
+        /* The access point's census: everything but its stations' good data frames to it. */
+        census_send(packet, type);
+        if (packet->rx_ctrl.rx_state || type == WIFI_PKT_CTRL || type == WIFI_PKT_MISC) return;
+    }
+    if (atomic_load(&s_mode) == MODE_SNIFF) {
+        /* Sniff: every management or data frame to or from one MAC, whole, without FCS. */
+        const int length = (int)packet->rx_ctrl.sig_len - 4;
+        const uint8_t *frame = packet->payload;
+        /* Every action frame too: a network the console moves to is keyed by its own advertisement. */
+        if ((type == WIFI_PKT_DATA || type == WIFI_PKT_MGMT) && length >= 24 && length <= 1600 &&
+            (!memcmp(frame + 4, s_sniff_mac, 6) || !memcmp(frame + 10, s_sniff_mac, 6) ||
+             (type == WIFI_PKT_MGMT && frame[0] == 0xD0))) {
+            /* The PHY fields: a flood's airtime is its bytes over its rate. */
+            const uint8_t head[5] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi,
+                                     rx_sig_mode(&packet->rx_ctrl), packet->rx_ctrl.rate,
+                                     rx_mcs_cwb(&packet->rx_ctrl)};
+            atomic_fetch_add(&s_rx_sniff, 1);
+            wire_send(MSG_RX_SNIFF, head, sizeof(head), frame, length);
+        } else if (type == WIFI_PKT_CTRL && length == 10 && frame[0] == 0xD4) {
+            /* Every ACK on the channel: it names only its receiver. Whether a data frame was
+               acknowledged is read off the one that follows it. docs/hardware_esp32.md */
+            const uint8_t head[5] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi,
+                                     rx_sig_mode(&packet->rx_ctrl), packet->rx_ctrl.rate,
+                                     rx_mcs_cwb(&packet->rx_ctrl)};
+            atomic_fetch_add(&s_rx_sniff, 1);
+            wire_send(MSG_RX_SNIFF, head, sizeof(head), frame, length);
+        }
+        return;
+    }
+    if (type == WIFI_PKT_DATA) {
+        const int length = (int)packet->rx_ctrl.sig_len - 4;
+        const uint8_t *frame = packet->payload;
+        if (atomic_load(&s_mode) != MODE_AP || length < 24) return;
+        const uint8_t head[2] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi};
+        if (!memcmp(frame + 4, s_peer, 6)) {
+            /* A station's frame to our BSSID: its first 40 bytes (802.11 and CCMP headers), for
+               the trace; the driver delivers the frame itself through RX_ETH. */
+            if (s_ap_flags2 & AP_FLAG2_RX_TIME) {
+                /* RX_TIME: the head grows by the MAC's u32 receive time in us. */
+                uint8_t stamped[6] = {head[0], head[1]};
+                const uint32_t stamp = packet->rx_ctrl.timestamp;   /* a bit-field */
+                memcpy(stamped + 2, &stamp, 4);
+                wire_send(MSG_RX_MGMT, stamped, 6, frame, length < 40 ? length : 40);
+            } else if (!(s_ap_flags & AP_FLAG_NO_DATA_TRACE))
+                wire_send(MSG_RX_MGMT, head, 2, frame, length < 40 ? length : 40);
+        } else if ((frame[1] & 3) == 0 && !memcmp(frame + 16, s_peer, 6) &&
+                   memcmp(frame + 10, s_peer, 6) && length <= 1600) {
+            /* A station's broadcast sent straight to the BSS (no DS bits, group key): an AP drops
+               it, so it goes to the host whole, still encrypted. docs/hardware_esp32.md */
+            if (atomic_load(&s_gift_on)) gift_post(GIFT_AIR, frame, length);
+            else wire_send(MSG_RX_MGMT, head, 2, frame, length);
+        }
+        return;
+    }
+    if (type != WIFI_PKT_MGMT) return;
+    const uint8_t *frame = packet->payload;
+    const int length = (int)packet->rx_ctrl.sig_len - 4;   /* sig_len counts the FCS */
+    if (length < 24) return;
+    const uint8_t subtype = frame[0] & 0xfc;
+    if (subtype == 0xd0 && length >= 24 + 4 && !memcmp(frame + 24, LDN_ACTION, 4)) {
+        const uint8_t head[2] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi};
+        atomic_fetch_add(&s_rx_mgmt, 1);
+        wire_send(MSG_RX_MGMT, head, 2, frame, length);
+    } else if (atomic_load(&s_mode) == MODE_AP && subtype != 0x80 && subtype != 0x40 &&
+               subtype != 0x50 && !memcmp(frame + 4, s_peer, 6)) {
+        /* A station's auth, (re)association, disassociation or deauthentication to our BSSID. */
+        const uint8_t head[2] = {packet->rx_ctrl.channel, (uint8_t)packet->rx_ctrl.rssi};
+        wire_send(MSG_RX_MGMT, head, 2, frame, length);
+    } else if (subtype == 0x10 && atomic_load(&s_mode) == MODE_STA_JOINING && length >= 28 &&
+               !memcmp(frame + 4, s_sta_mac, 6) && !memcmp(frame + 10, s_peer, 6) &&
+               frame[26] == 0 && frame[27] == 0) {
+        atomic_store(&s_assoc_seen, true);   /* association response, status 0 */
+    }
+}
+
+static void start_sniffer(void)
+{
+    const bool sniff = atomic_load(&s_mode) == MODE_SNIFF;
+    const wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       (atomic_load(&s_mode) >= MODE_AP ? WIFI_PROMIS_FILTER_MASK_DATA : 0) |
+                       (sniff ? WIFI_PROMIS_FILTER_MASK_CTRL : 0) |
+                       ((sniff && s_census) || (atomic_load(&s_mode) == MODE_AP && (s_ap_flags2 & AP_FLAG2_CENSUS))
+                            ? WIFI_PROMIS_FILTER_MASK_MISC | WIFI_PROMIS_FILTER_MASK_FCSFAIL |
+                              WIFI_PROMIS_FILTER_MASK_CTRL : 0)};
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
+    if (sniff || (s_ap_flags2 & AP_FLAG2_CENSUS)) {
+        const wifi_promiscuous_filter_t ctrl = {
+            .filter_mask = (s_census || !sniff) ? WIFI_PROMIS_CTRL_FILTER_MASK_ALL : WIFI_PROMIS_CTRL_FILTER_MASK_ACK};
+        ESP_ERROR_CHECK(esp_wifi_set_promiscuous_ctrl_filter(&ctrl));
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(promiscuous_rx));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+}
+
+static esp_err_t ethernet_rx(void *buffer, uint16_t length, void *eb)
+{
+    atomic_fetch_add(&s_rx_eth, 1);
+    if (atomic_load(&s_gift_on)) gift_post(GIFT_FRAME, buffer, length);
+    else wire_send(MSG_RX_ETH, buffer, length, NULL, 0);
+    esp_wifi_internal_free_rx_buffer(eb);
+    return ESP_OK;
+}
+
+static void tx_done(uint8_t ifidx, uint8_t *data, uint16_t *length, bool acked)
+{
+    const uint32_t now = (uint32_t)esp_timer_get_time();
+    atomic_fetch_add(acked ? &s_tx_acked : &s_tx_unacked, 1);
+    const uint16_t n = length ? *length : 0;
+    uint32_t queued = UINT32_MAX;
+    /* A data frame with a body (not a null function) is one of the host's ETH_TX, in order. */
+    if (data && n >= 24 && (data[0] & 0x0c) == 0x08 && !(data[0] & 0x40)) {
+        const unsigned tail = atomic_load(&s_tx_handed_tail);
+        if (tail != atomic_load(&s_tx_handed_head)) {
+            queued = now - s_tx_handed[tail % TX_RING];
+            atomic_store(&s_tx_handed_tail, tail + 1);
+            if (queued > atomic_load(&s_tx_queued_max_us)) atomic_store(&s_tx_queued_max_us, queued);
+            atomic_fetch_add(&s_tx_queued_total_us, queued);
+            atomic_fetch_add(&s_tx_queued_n, 1);
+        }
+    }
+    /* Diagnostic only; over BLE it crowded the console's own RX_ETH out of the queue. */
+    if (ble_linked()) return;
+    uint8_t head[12];
+    memcpy(head, &now, 4);
+    memcpy(head + 4, &queued, 4);
+    head[8] = acked;
+    head[9] = ifidx;
+    memcpy(head + 10, &n, 2);
+    wire_send(MSG_TX_DONE, head, sizeof(head), data, data ? (n < 24 ? n : 24) : 0);
+}
+
+static int ldn_sta_connect(uint8_t *bssid)
+{
+    /* The stock callback rebuilds the RSN element; install ours on both sides of it. */
+    int r = esp_wifi_set_appie_internal(APPIE_RSN, s_rsn_ie, sizeof(s_rsn_ie), 0);
+    if (r == 0 && s_stock_sta_connect) r = s_stock_sta_connect(bssid);
+    if (r == 0) r = esp_wifi_set_appie_internal(APPIE_RSN, s_rsn_ie, sizeof(s_rsn_ie), 0);
+    return r;
+}
+
+static void ldn_sta_connected(uint8_t *bssid) { (void)bssid; }
+static int ldn_sta_rx_eapol(uint8_t *source, uint8_t *buffer, uint32_t length) { return 0; }
+static bool ldn_sta_in_handshake(void) { return false; }
+
+/* Accept the association and answer it, but start no authenticator state machine: the main loop
+   installs the pairwise key and opens the port (ap_open_station). */
+static bool ldn_ap_join(priv_join_param_t *join)
+{
+    if (s_ap_flags & AP_FLAG_STOCK_JOIN) return s_stock_ap_join(join);
+    struct hostapd_data *hapd = hostapd_get_hapd_data();
+    if (!hapd || !join || !join->bssid) return false;
+    struct sta_info *sta = ap_get_sta(hapd, join->bssid);
+    if (!sta) sta = ap_sta_add(hapd, join->bssid);
+    if (!sta) return false;
+    if (esp_send_assoc_resp(hapd, join->bssid, 0, true, join->subtype) != 0) return false;
+    if (join->pmf_enable) *join->pmf_enable = false;
+    if (join->pairwise_cipher) *join->pairwise_cipher = 3;   /* bit of WPA_CIPHER_CCMP */
+    *join->sm = sta;
+    xQueueSend(s_ap_joins, join->bssid, 0);
+    return true;
+}
+
+static bool ldn_ap_rx_eapol(void *hapd, void *sm, uint8_t *data, size_t length) { return true; }
+
+/* The beacon and probe response take their RSN element from here; hostapd's own lacks the
+   Switch's capabilities 0x000c. */
+static uint8_t *ldn_ap_get_wpa_ie(size_t *length)
+{
+    *length = sizeof(s_rsn_ie);
+    return s_rsn_ie;
+}
+
+static void install_hooks(void)
+{
+    struct wpa_funcs *table = malloc(sizeof(*table));
+    ESP_ERROR_CHECK(table ? ESP_OK : ESP_ERR_NO_MEM);
+    memcpy(table, wpa_cb, sizeof(*table));
+    s_stock_sta_connect = table->wpa_sta_connect;
+    s_stock_ap_join = table->wpa_ap_join;
+    table->wpa_sta_connect = ldn_sta_connect;
+    table->wpa_sta_connected_cb = ldn_sta_connected;
+    table->wpa_sta_rx_eapol = ldn_sta_rx_eapol;
+    table->wpa_sta_in_4way_handshake = ldn_sta_in_handshake;
+    table->wpa_ap_join = ldn_ap_join;
+    table->wpa_ap_rx_eapol = ldn_ap_rx_eapol;
+    table->wpa_ap_get_wpa_ie = ldn_ap_get_wpa_ie;
+    ESP_ERROR_CHECK(esp_wifi_register_wpa_cb_internal(table));
+    wpa_cb = table;
+}
+
+static void go_idle(void)
+{
+    atomic_store(&s_mode, MODE_IDLE);
+    atomic_store(&s_ap_stations, 0);
+    atomic_store(&s_tx_handed_tail, atomic_load(&s_tx_handed_head));   /* a new link's frames only */
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    memset(s_key, 0, sizeof(s_key));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    start_sniffer();
+}
+
+static uint8_t s_sta_rate;   /* an index into AP_FIXED_RATES; 0 leaves rate control on */
+static uint8_t s_sta_power;  /* esp_wifi_set_max_tx_power units (0.25 dBm, 8..84); 0 leaves it */
+static uint8_t s_sta_flags;  /* 1 RTS on every frame, 2 no RTS before a retry */
+/* libpp: exported, not in the headers; both read and write lmacConfMib +22 (u16 RTS threshold, 2346)
+   and +42 (retries before RTS, 0). docs/hardware_esp32.md */
+typedef struct __attribute__((packed)) { uint16_t thr; uint8_t retries_before_rts, cnt_long, cnt_short; } rts_cfg_t;
+extern int esp_wifi_internal_set_rts(const void *p);
+extern int esp_wifi_internal_get_rts(void *p);
+
+static esp_err_t sta_join(const uint8_t *p, size_t n)
+{
+    /* Optional: a byte pinning the station's data rate (the AP flag bits 3..5 table), then its
+       maximum TX power. docs/hardware_esp32.md */
+    if (n < 1 + 6 + 32 + 16 + 6 || n > 1 + 6 + 32 + 16 + 6 + 3) return ESP_ERR_INVALID_SIZE;
+    s_sta_rate = n > 61 ? p[61] & 7 : 0;
+    s_sta_power = n > 62 ? p[62] : 0;
+    s_sta_flags = n > 63 ? p[63] : 0;
+    const uint8_t channel = p[0];
+    if (channel < 1 || channel > 13 || (p[1] & 1)) return ESP_ERR_INVALID_ARG;
+    go_idle();
+    memcpy(s_peer, p + 1, 6);
+    memcpy(s_key, p + 39, 16);
+    memcpy(s_sta_mac, p + 55, 6);
+    if (!memcmp(s_sta_mac, "\0\0\0\0\0\0", 6)) {
+        esp_fill_random(s_sta_mac, 6);
+        s_sta_mac[0] = (s_sta_mac[0] & 0xfc) | 2;
+    }
+    esp_wifi_stop();
+    esp_err_t r = esp_wifi_set_mac(WIFI_IF_STA, s_sta_mac);
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    /* An HE station adds Wi-Fi 6 elements to its association request; the other targets send none. */
+    if (r == ESP_OK) r = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
+    if (r != ESP_OK) return r;
+    esp_wifi_start();
+    esp_wifi_set_tx_done_cb(tx_done);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    start_sniffer();
+    wifi_config_t config = {0};
+    memcpy(config.sta.ssid, p + 7, 32);
+    memcpy(config.sta.password, "00000000", 8);
+    memcpy(config.sta.bssid, s_peer, 6);
+    config.sta.bssid_set = true;
+    config.sta.channel = channel;
+    config.sta.scan_method = WIFI_FAST_SCAN;
+    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    r = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (r != ESP_OK) return r;
+    atomic_store(&s_assoc_seen, false);
+    s_join_started = esp_timer_get_time();
+    atomic_store(&s_mode, MODE_STA_JOINING);
+    r = esp_wifi_connect();
+    if (r != ESP_OK) atomic_store(&s_mode, MODE_IDLE);
+    return r;
+}
+
+static void sta_link(bool up, uint16_t reason)
+{
+    if (!up && reason >= 0xfffe) atomic_fetch_add(&s_led_alarm, 1);
+    uint8_t head[9] = {up};
+    memcpy(head + 1, &reason, 2);
+    memcpy(head + 3, s_sta_mac, 6);
+    wire_send(MSG_LINK, head, sizeof(head), NULL, 0);
+}
+
+static void sta_install_keys(void)
+{
+    uint8_t sequence[8] = {0};   /* the pinned blob copies eight RSC bytes */
+    const int pairwise = esp_wifi_set_sta_key_internal(WPA_ALG_CCMP, s_peer, 0, 1, sequence, 8, s_key,
+                                                       16, KEY_FLAG_PAIRWISE | KEY_FLAG_RX | KEY_FLAG_TX);
+    const int group = esp_wifi_set_sta_key_internal(WPA_ALG_CCMP, s_peer, 1, 0, sequence, 8, s_key, 16,
+                                                    KEY_FLAG_GROUP | KEY_FLAG_RX);
+    if (pairwise || group) {
+        wire_log("sta key install failed pairwise=%d group=%d", pairwise, group);
+        go_idle();
+        sta_link(false, 0xfffe);
+        return;
+    }
+    esp_wifi_auth_done_internal();
+    esp_wifi_internal_reg_rxcb(WIFI_IF_STA, ethernet_rx);
+    atomic_store(&s_mode, MODE_STA);
+    if (s_sta_flags) {
+        rts_cfg_t rts = {0};
+        const int got = esp_wifi_internal_get_rts(&rts);
+        wire_log("sta rts before: %d thr %u retries %u long %u short %u", got, rts.thr, rts.retries_before_rts,
+                 rts.cnt_long, rts.cnt_short);
+        if (s_sta_flags & 1) rts.thr = 0;
+        if (s_sta_flags & 2) rts.retries_before_rts = 255;
+        const int set = esp_wifi_internal_set_rts(&rts);
+        esp_wifi_internal_get_rts(&rts);
+        wire_log("sta rts after: %d thr %u retries %u", set, rts.thr, rts.retries_before_rts);
+    }
+    if (s_sta_power) {
+        int8_t before = 0, after = 0;
+        esp_wifi_get_max_tx_power(&before);
+        const esp_err_t set = esp_wifi_set_max_tx_power((int8_t)s_sta_power);
+        esp_wifi_get_max_tx_power(&after);
+        wire_log("sta max tx power %u: %d, %d -> %d", s_sta_power, set, before, after);
+    }
+    if (s_sta_rate)
+        wire_log("sta fixed rate %u: %d", s_sta_rate,
+                 esp_wifi_internal_set_fix_rate(WIFI_IF_STA, true, AP_FIXED_RATES[s_sta_rate]));
+    sta_link(true, 0);
+}
+
+/* libpp: clears g_pm+21, after which pm_noise_check returns before measuring. The check runs every
+   NoiseTimerInterval (100) and the receiver misses frames on that cycle. docs/hardware_esp32.md */
+extern void pm_noise_check_disable(void);
+extern uint16_t NoiseTimerInterval;   /* libpp pp.o .data, 100 */
+/* libpp lmac.o: esp_wifi_internal_set_retry_counter(a, b) stores a at +21 and b at +20. */
+extern uint8_t lmacConfMib[];
+extern int esp_wifi_internal_set_retry_counter(int src, int lrc);
+
+static esp_err_t ap_start(const uint8_t *p, size_t n)
+{
+    /* Optional: a second flag byte (AP_FLAG2_*), then a maximum TX power in 0.25 dBm. */
+    if (n < 1 + 6 + 32 + 16 + 1 + 1 || n > 1 + 6 + 32 + 16 + 1 + 1 + 2) return ESP_ERR_INVALID_SIZE;
+    const uint8_t flags2 = n > 57 ? p[57] : 0;
+    const uint8_t ap_power = n > 58 ? p[58] : 0;
+    s_ap_flags2 = flags2;
+    if (flags2 & AP_FLAG2_NOISE_250) NoiseTimerInterval = 250;   /* before the driver arms it */
+    const uint8_t channel = p[0];
+    if (channel < 1 || channel > 13 || (p[1] & 1)) return ESP_ERR_INVALID_ARG;
+    go_idle();
+    esp_wifi_stop();
+    memcpy(s_peer, p + 1, 6);   /* our BSSID */
+    memcpy(s_key, p + 39, 16);
+    s_ap_flags = p[56];
+    esp_err_t r = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (r == ESP_OK) r = esp_wifi_set_mac(WIFI_IF_AP, s_peer);
+    /* 11b/g: no HT elements, as a Switch host sends none. docs/hardware_esp32.md */
+    if (r == ESP_OK) r = esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+    if (r != ESP_OK) return r;
+    wifi_config_t config = {0};
+    memcpy(config.ap.ssid, p + 7, 32);
+    config.ap.ssid_len = 32;
+    memcpy(config.ap.password, "00000000", 8);
+    config.ap.channel = channel;
+    config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    config.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+    config.ap.ssid_hidden = 1;
+    config.ap.max_connection = p[55] ? p[55] : 7;
+    /* 1000 TU bisects the receive misses against the beacon. docs/hardware_esp32.md */
+    config.ap.beacon_interval = (s_ap_flags & AP_FLAG_LONG_BEACON) ? 1000 : 100;
+    config.ap.pmf_cfg.required = false;
+    r = esp_wifi_set_config(WIFI_IF_AP, &config);
+    if (r == ESP_OK) r = esp_wifi_start();
+    if (r != ESP_OK) return r;
+    esp_wifi_set_tx_done_cb(tx_done);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_inactive_time(WIFI_IF_AP, 3600);
+    if (flags2 & AP_FLAG2_NO_NOISE_CHECK) {
+        pm_noise_check_disable();
+        wire_log("ap noise check off");
+    }
+    if (flags2 & AP_FLAG2_RETRY_7_4) esp_wifi_internal_set_retry_counter(7, 4);   /* 802.11 defaults */
+    wire_log("ap noise interval %u", (unsigned)NoiseTimerInterval);
+    wire_log("ap lmacConfMib 16..27: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+             lmacConfMib[16], lmacConfMib[17], lmacConfMib[18], lmacConfMib[19], lmacConfMib[20],
+             lmacConfMib[21], lmacConfMib[22], lmacConfMib[23], lmacConfMib[24], lmacConfMib[25],
+             lmacConfMib[26], lmacConfMib[27]);
+    if (AP_FLAG_RATE(s_ap_flags)) {
+        const esp_err_t fixed = esp_wifi_internal_set_fix_rate(WIFI_IF_AP, true,
+                                                               AP_FIXED_RATES[AP_FLAG_RATE(s_ap_flags)]);
+        wire_log("ap fixed rate %u: %d", AP_FLAG_RATE(s_ap_flags), fixed);
+    }
+    if (ap_power) {
+        int8_t before = 0, after = 0;
+        esp_wifi_get_max_tx_power(&before);
+        const esp_err_t set = esp_wifi_set_max_tx_power((int8_t)ap_power);
+        esp_wifi_get_max_tx_power(&after);
+        wire_log("ap max tx power %u: %d, %d -> %d", ap_power, set, before, after);
+    }
+    atomic_store(&s_mode, MODE_AP);
+    /* NO_PROMISC bisects the receive misses; no RX_MGMT copies then. docs/hardware_esp32.md */
+    if (s_ap_flags & AP_FLAG_NO_PROMISC) esp_wifi_set_promiscuous(false);
+    else start_sniffer();
+    return ESP_OK;
+}
+
+/* esp_wifi_wpa_ptk_init_done_internal opens the port and is what posts AP_STACONNECTED (event 14);
+   with no 4-way handshake nothing else calls it. docs/hardware_esp32.md */
+/* libnet80211's node table (FreeBSD net80211 layout): ni_flags at +12, bit 1 IEEE80211_NODE_QOS. */
+extern void *cnx_node_search(const uint8_t *mac);
+
+static void ap_open_station(const uint8_t *mac)
+{
+    volatile uint32_t *flags = NULL;
+    uint8_t *node = cnx_node_search(mac);
+    if (node) flags = (volatile uint32_t *)(node + 12);
+    wire_log("ap station node %p flags %08lx", node, flags ? (unsigned long)*flags : 0UL);
+    if (flags && (s_ap_flags & AP_FLAG_NO_QOS)) *flags &= ~2u;   /* plain data frames, as a Switch host sends */
+    s_ap_pairwise = esp_wifi_set_ap_key_internal(WPA_ALG_CCMP, mac, 0, s_key, 16);
+    if (s_ap_pairwise) atomic_fetch_add(&s_led_alarm, 1);
+    if (s_ap_pairwise) wire_log("ap pairwise key install failed %d", s_ap_pairwise);
+    esp_wifi_wpa_ptk_init_done_internal((uint8_t *)mac);
+}
+
+static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event = data;
+        const enum mode mode = atomic_load(&s_mode);
+        if (mode == MODE_STA || mode == MODE_STA_JOINING) {
+            atomic_store(&s_mode, MODE_IDLE);
+            sta_link(false, event->reason);
+        }
+    } else if (id == WIFI_EVENT_AP_START) {
+        const int group = esp_wifi_set_ap_key_internal(WPA_ALG_CCMP, BROADCAST, 1, s_key, 16);
+        esp_wifi_internal_reg_rxcb(WIFI_IF_AP, ethernet_rx);
+        uint8_t head[9] = {1};
+        memcpy(head + 3, s_peer, 6);
+        if (group) { head[0] = 0; atomic_fetch_add(&s_led_alarm, 1); wire_log("ap group key install failed %d", group); }
+        wire_send(MSG_LINK, head, sizeof(head), NULL, 0);
+    } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+        const wifi_event_ap_staconnected_t *event = data;
+        uint8_t head[9];
+        memcpy(head, event->mac, 6);
+        head[6] = event->aid;
+        head[7] = (uint8_t)s_ap_pairwise;
+        head[8] = 1;
+        atomic_fetch_add(&s_ap_stations, 1);
+        if (atomic_load(&s_gift_on)) gift_post(GIFT_JOINED, event->mac, 6);
+        wire_send(MSG_STA_JOINED, head, sizeof(head), NULL, 0);
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        const wifi_event_ap_stadisconnected_t *event = data;
+        uint8_t head[8];
+        memcpy(head, event->mac, 6);
+        memcpy(head + 6, &event->reason, 2);
+        if (atomic_fetch_sub(&s_ap_stations, 1) <= 0) atomic_store(&s_ap_stations, 0);
+        if (atomic_load(&s_gift_on)) gift_post(GIFT_LEFT, event->mac, 6);
+        wire_send(MSG_STA_LEFT, head, sizeof(head), NULL, 0);
+    }
+}
+
+/* A BOOT press: u32 board time in µs, u16 press count, for the host's trace. */
+static void button_pressed(uint32_t count, int64_t press_us)
+{
+    uint8_t head[6];
+    const uint32_t us = (uint32_t)press_us;
+    const uint16_t n = (uint16_t)count;
+    atomic_store(&s_presses, count);
+    memcpy(head, &us, 4);
+    memcpy(head + 4, &n, 2);
+    wire_send(MSG_BUTTON, head, sizeof(head), NULL, 0);
+}
+
+/* The automatic look by mode: docs/hardware_esp32.md, The board's LED and buttons. */
+static void led_state(led_look_t *look, uint32_t *activity, uint32_t *alarm)
+{
+    switch (atomic_load(&s_mode)) {
+    case MODE_IDLE: *look = (led_look_t){LED_BREATHE, 50, 4000}; break;
+    case MODE_STA_JOINING: *look = (led_look_t){LED_BLINK, 255, 250}; break;
+    case MODE_AP:
+        if (atomic_load(&s_ap_stations) <= 0) { *look = (led_look_t){LED_BREATHE, 110, 1500}; break; }
+        __attribute__((fallthrough));   /* a seated console looks like a joined one */
+    case MODE_STA: *look = (led_look_t){LED_ON, 25, 0}; break;
+    case MODE_SNIFF: *look = (led_look_t){LED_OFF, 0, 0}; break;
+    }
+    *activity = atomic_load(&s_rx_eth) + atomic_load(&s_tx_acked) + atomic_load(&s_tx_unacked) +
+                atomic_load(&s_rx_sniff);
+    *alarm = atomic_load(&s_led_alarm) + wire_dropped() + wire_rx_bad() + wire_rx_fifo_ovf() +
+             wire_rx_buffer_full();
+}
+
+static void display_state(scene_radio_t *state)
+{
+    static const uint8_t SCENES[] = {
+        [MODE_IDLE] = SCENE_IDLE, [MODE_STA_JOINING] = SCENE_JOINING, [MODE_STA] = SCENE_JOINED,
+        [MODE_AP] = SCENE_HOSTING, [MODE_SNIFF] = SCENE_SNIFFING,
+    };
+    state->mode = SCENES[atomic_load(&s_mode)];
+    const int stations = atomic_load(&s_ap_stations);
+    state->stations = stations > 0 ? (uint8_t)stations : 0;
+    state->rx = atomic_load(&s_rx_eth);
+    state->tx = atomic_load(&s_tx_acked) + atomic_load(&s_tx_unacked);
+    state->presses = atomic_load(&s_presses);
+}
+
+static void send_status(void)
+{
+    char text[768];
+    int len = snprintf(text, sizeof(text),
+        "mode=%d rx_mgmt=%u rx_eth=%u tx_eth=%u tx_eth_failed=%u tx_raw=%u tx_raw_failed=%u "
+        "wire_dropped=%u heap=%u tx_acked=%u tx_unacked=%u tx_eth_retried=%u tx_eth_last_err=%#x "
+        "wire_rx_bad=%u uart_overflow=%u uart_fifo_ovf=%u uart_buffer_full=%u uart_frame_err=%u "
+        "uart_events_full=%u "
+        "tx_eth_max_us=%u tx_eth_total_us=%u tx_eth_slow=%u "
+        "tx_queued_max_us=%u tx_queued_total_us=%u tx_queued_n=%u tx_queued_pending=%u",
+        (int)atomic_load(&s_mode), atomic_load(&s_rx_mgmt), atomic_load(&s_rx_eth),
+        atomic_load(&s_tx_eth), atomic_load(&s_tx_eth_failed), atomic_load(&s_tx_raw),
+        atomic_load(&s_tx_raw_failed), (unsigned)wire_dropped(),
+        (unsigned)esp_get_free_heap_size(), atomic_load(&s_tx_acked), atomic_load(&s_tx_unacked),
+        atomic_load(&s_tx_eth_retried), (unsigned)atomic_load(&s_tx_eth_last_err),
+        (unsigned)wire_rx_bad(), (unsigned)(wire_rx_fifo_ovf() + wire_rx_buffer_full()),
+        (unsigned)wire_rx_fifo_ovf(), (unsigned)wire_rx_buffer_full(),
+        (unsigned)wire_rx_frame_err(), (unsigned)wire_events_full(),
+        atomic_load(&s_tx_eth_max_us), atomic_load(&s_tx_eth_total_us), atomic_load(&s_tx_eth_slow),
+        atomic_load(&s_tx_queued_max_us), atomic_load(&s_tx_queued_total_us),
+        atomic_load(&s_tx_queued_n),
+        atomic_load(&s_tx_handed_head) - atomic_load(&s_tx_handed_tail));
+    if (len < 0) return;
+    if (len < (int)sizeof(text) - 1) {
+        text[len++] = ' ';
+        const int more = wire_stats(text + len, sizeof(text) - len);
+        if (more > 0) len += more;
+    }
+    if (len >= (int)sizeof(text)) len = sizeof(text) - 1;
+    wire_send(MSG_STATUS, text, len, NULL, 0);
+}
+
+/* BENCH: u32 bytes, u16 message size. Random payloads, each led by a u32 sequence, then one led by
+   0xffffffff carrying the board's microseconds; nothing is dropped. docs/hardware_esp32.md */
+static void bench_task(void *arg)
+{
+    const uint32_t total = ((uint32_t *)arg)[0], size = ((uint32_t *)arg)[1];
+    free(arg);
+    static uint8_t body[WIRE_MAX_PAYLOAD];
+    const int64_t started = esp_timer_get_time();
+    uint32_t seq = 0;
+    /* Filled once: a fill per message held BENCH under the 1500000 line's rate, so its queue never
+       backed up the way a console's flood backs it up. */
+    esp_fill_random(body, sizeof(body));
+    for (uint32_t sent = 0; sent < total; sent += size, ++seq) {
+        memcpy(body, &seq, 4);
+        while (!wire_send_wait(MSG_BENCH, NULL, 0, body, size, pdMS_TO_TICKS(100))) {}
+    }
+    const uint32_t done[2] = {UINT32_MAX, (uint32_t)(esp_timer_get_time() - started)};
+    while (!wire_send_wait(MSG_BENCH, NULL, 0, done, sizeof(done), pdMS_TO_TICKS(100))) {}
+    vTaskDelete(NULL);
+}
+
+static void send_info(void)
+{
+    uint8_t head[1 + 6 + 6 + 1];
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    head[0] = PROTOCOL_VERSION;
+    esp_wifi_get_mac(WIFI_IF_STA, head + 1);
+    esp_read_mac(head + 7, ESP_MAC_WIFI_SOFTAP);
+    head[13] = (uint8_t)(chip.revision / 100);
+    char text[128];
+#if POKELDN_BLE
+#define LINK_WORD " link=ble"   /* gui/board.py Identity.ble: the Board page names the Bluetooth build */
+#else
+#define LINK_WORD ""
+#endif
+#ifdef POKELDN_DISPLAY_E32R40T
+#define DISPLAY_WORD " display=e32r40t"   /* gui/board.py Identity.stock: no OLED image offered over it */
+#elif defined(POKELDN_DISPLAY_T_DONGLE_S3)
+#define DISPLAY_WORD " display=t-dongle-s3"  /* prevents the app offering a generic OLED flash */
+#else
+#define DISPLAY_WORD ""
+#endif
+    snprintf(text, sizeof(text), "pokeldn-radio " CONFIG_IDF_TARGET " version=%s idf=" IDF_VER LINK_WORD DISPLAY_WORD,
+             esp_app_get_description()->version);
+    wire_send(MSG_INFO, head, sizeof(head), text, strlen(text));
+    usbwatch_report();
+}
+
+static _Atomic int64_t s_host_seen;   /* when the host last sent a command */
+
+/* The portable beacon: with no command in BEACON_GRACE_US after boot, the stored image's access point
+   comes up and its advertisements cycle; a host command that takes the radio ends it.
+   docs/hardware_esp32.md, Portable beacon. */
+#define BEACON_GRACE_US 3000000
+enum { BEACON_WRITE = 0, BEACON_COMMIT = 1, BEACON_ERASE = 2, BEACON_START = 3, BEACON_QUERY = 4 };
+static atomic_bool s_beacon_on, s_beacon_busy;
+static TaskHandle_t s_beacon_task;
+
+/* A host image's start screen: every command but the last, which is the delivered one. */
+static void beacon_screen(const advert_image_t *image)
+{
+    const unsigned start = image->kind == ADVERT_KIND_HOST && image->display_count > 2
+                               ? image->display_count - 1u : image->display_count;
+    for (unsigned i = 0; i < start; ++i) display_command(image->display[i], image->display_len[i]);
+}
+
+static void gift_send(void *context, const uint8_t *frame, size_t length)
+{
+    (void)context;
+    static uint8_t copy[1600];
+    if (length > sizeof(copy)) return;
+    memcpy(copy, frame, length);
+    int r = esp_wifi_internal_tx(WIFI_IF_AP, copy, length);
+    for (int tries = 0; r == ESP_ERR_NO_MEM && tries < 100; ++tries) {
+        vTaskDelay(1);
+        r = esp_wifi_internal_tx(WIFI_IF_AP, copy, length);
+    }
+    atomic_fetch_add(r == ESP_OK ? &s_tx_eth : &s_tx_eth_failed, 1);
+}
+
+static void gift_kick(void *context, const uint8_t mac[6])
+{
+    (void)context;
+    uint8_t copy[6];
+    memcpy(copy, mac, 6);
+    esp_wifi_ap_deauth_internal(copy, 3);
+}
+
+static void gift_event(void *context, int event, int value)
+{
+    const advert_image_t *image = context;
+    wire_log("gift event %d value %d", event, value);
+    if (event == GIFT_EVENT_REFUSED) atomic_fetch_add(&s_led_alarm, 1);
+    if (event == GIFT_EVENT_LEFT && value && image->kind == ADVERT_KIND_HOST && image->display_count > 2) {
+        const unsigned last = image->display_count - 1u;
+        display_command(image->display[last], image->display_len[last]);
+        beacon_screen(image);   /* back to the card once the delivered scene ends */
+    }
+}
+
+static uint32_t gift_random(void *context)
+{
+    (void)context;
+    return esp_random();
+}
+
+/* The portable gift host: the image's Mystery Gift, played to every console that joins, until a
+   host takes the radio. docs/hardware_esp32.md, Portable beacon. */
+static void gift_run(const advert_image_t *image)
+{
+    static uint8_t plain[GIFT_ADVERT_MAX], frame[ADVERT_FRAME_MAX];
+    const gift_image_t *gift = beacon_gift();
+    void *memory = gift && gift_zstd_ready() ? malloc(gift_host_size()) : NULL;
+    if (!memory) {
+        wire_log("gift host: no image or no memory");
+        atomic_fetch_add(&s_led_alarm, 1);
+        while (atomic_load(&s_beacon_on) && atomic_load(&s_mode) == MODE_AP) vTaskDelay(pdMS_TO_TICKS(100));
+        return;
+    }
+    wire_log("gift host: %u bytes; heap %u free, %u in one block", (unsigned)gift_host_size(),
+             (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    gift_platform_t platform = {.random = gift_random, .send = gift_send, .kick = gift_kick,
+                                .event = gift_event, .context = (void *)image};
+    beacon_gift_crypto(&platform);
+    gift_host_t *host = gift_host_start(memory, gift, &platform, (uint64_t)esp_timer_get_time());
+    atomic_store(&s_gift_on, true);
+    const uint32_t nonce = esp_random();
+    int64_t deadline = 0, next_advert = 0;
+    while (atomic_load(&s_beacon_on) && atomic_load(&s_mode) == MODE_AP) {
+        int64_t now = esp_timer_get_time();
+        const int64_t until = (deadline < next_advert ? deadline : next_advert) - now;
+        const TickType_t wait = until > 0 ? pdMS_TO_TICKS(until / 1000) : 0;
+        gift_item_t *item;
+        if (xQueueReceive(s_gift_inbox, &item, wait > pdMS_TO_TICKS(50) ? pdMS_TO_TICKS(50) : wait) == pdTRUE) {
+            now = esp_timer_get_time();
+            if (item->kind == GIFT_FRAME) gift_host_rx(host, item->data, item->length, (uint64_t)now);
+            else if (item->kind == GIFT_AIR) gift_host_rx_80211(host, item->data, item->length, (uint64_t)now);
+            else gift_host_station(host, item->data, item->kind == GIFT_JOINED, (uint64_t)now);
+            free(item);
+            deadline = 0;
+        }
+        now = esp_timer_get_time();
+        if (now >= deadline) deadline = (int64_t)gift_host_poll(host, (uint64_t)now);
+        if (now >= next_advert) {
+            uint32_t version = 0;
+            size_t n = gift_host_advert(host, plain, &version);
+            n = advert_frame_plain(image, plain, n, nonce + version, &beacon_crypto, frame);
+            const esp_err_t r = n ? esp_wifi_80211_tx(WIFI_IF_AP, frame, n, true) : ESP_FAIL;
+            atomic_fetch_add(r == ESP_OK ? &s_tx_raw : &s_tx_raw_failed, 1);
+            next_advert = now + (int64_t)image->interval_ms * 1000;
+        }
+    }
+    atomic_store(&s_gift_on, false);
+    gift_item_t *item;
+    while (xQueueReceive(s_gift_inbox, &item, 0) == pdTRUE) free(item);
+    free(memory);
+}
+
+static void beacon_task(void *arg)
+{
+    static uint8_t frame[ADVERT_FRAME_MAX];
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        atomic_store(&s_beacon_busy, true);
+        const advert_image_t *image = beacon_image();
+        if (image && image->kind == ADVERT_KIND_HOST) {
+            gift_run(image);
+            atomic_store(&s_beacon_on, false);
+            atomic_store(&s_beacon_busy, false);
+            continue;
+        }
+        /* A fresh nonce per start, as a host takes a random one per network. */
+        uint32_t nonce = esp_random();
+        unsigned index = 0;
+        int64_t switched = esp_timer_get_time();
+        while (image && atomic_load(&s_beacon_on) && atomic_load(&s_mode) == MODE_AP) {
+            const size_t n = advert_frame(image, index, nonce, &beacon_crypto, frame);
+            const esp_err_t r = n ? esp_wifi_80211_tx(WIFI_IF_AP, frame, n, true) : ESP_FAIL;
+            atomic_fetch_add(r == ESP_OK ? &s_tx_raw : &s_tx_raw_failed, 1);
+            vTaskDelay(pdMS_TO_TICKS(image->interval_ms));
+            if (esp_timer_get_time() - switched >= (int64_t)image->dwell_ms * 1000) {
+                index = (index + 1) % image->count;
+                ++nonce;                  /* the host advances it with every new application data */
+                switched = esp_timer_get_time();
+            }
+        }
+        atomic_store(&s_beacon_on, false);
+        atomic_store(&s_beacon_busy, false);
+    }
+}
+
+static esp_err_t beacon_start(void)
+{
+    const advert_image_t *image = beacon_image();
+    if (!image) return ESP_ERR_NOT_FOUND;
+    uint8_t p[1 + 6 + 32 + 16 + 1 + 1] = {image->channel};
+    memcpy(p + 1, image->bssid, 6);
+    memcpy(p + 7, image->ssid, 32);
+    memcpy(p + 39, image->data_key, 16);
+    p[55] = image->max_stations;
+    const esp_err_t r = ap_start(p, sizeof(p));
+    if (r != ESP_OK) return r;
+    beacon_screen(image);
+    if (!s_gift_inbox) s_gift_inbox = xQueueCreate(32, sizeof(gift_item_t *));
+    /* The gift host's datagram path takes about 5 KB of stack (gift_pia.c). */
+    if (!s_beacon_task) xTaskCreatePinnedToCore(beacon_task, "beacon", 12288, NULL, 4, &s_beacon_task, 0);
+    atomic_store(&s_beacon_on, true);
+    xTaskNotifyGive(s_beacon_task);
+    return ESP_OK;
+}
+
+/* Ends the cycle and waits out the frame in flight, so the image can be replaced. */
+static void beacon_stop(void)
+{
+    atomic_store(&s_beacon_on, false);
+    for (int i = 0; i < 200 && atomic_load(&s_beacon_busy); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+/* QUERY: u8 stored, u8 running, u8 fragments, u16 image length, u32 image CRC-32. */
+static void beacon_query(void)
+{
+    const advert_image_t *image = beacon_image();
+    uint16_t length;
+    uint32_t crc;
+    beacon_identity(&length, &crc);
+    uint8_t head[9] = {image != NULL, atomic_load(&s_beacon_on), image ? image->count : 0};
+    memcpy(head + 3, &length, 2);
+    memcpy(head + 5, &crc, 4);
+    wire_send(MSG_BEACON, head, sizeof(head), NULL, 0);
+}
+
+/* BEACON: u8 op, then WRITE u32 offset and bytes, COMMIT u16 length. */
+static void beacon_command(const uint8_t *p, size_t n)
+{
+    if (!n) { result(CMD_BEACON, ESP_ERR_INVALID_SIZE); return; }
+    switch (p[0]) {
+    case BEACON_WRITE: {
+        uint32_t offset;
+        if (n < 5) { result(CMD_BEACON, ESP_ERR_INVALID_SIZE); return; }
+        memcpy(&offset, p + 1, 4);
+        result(CMD_BEACON, beacon_write(offset, p + 5, n - 5));
+        return;
+    }
+    case BEACON_COMMIT: {
+        uint16_t length;
+        if (n != 3) { result(CMD_BEACON, ESP_ERR_INVALID_SIZE); return; }
+        memcpy(&length, p + 1, 2);
+        beacon_stop();
+        result(CMD_BEACON, beacon_commit(length));
+        return;
+    }
+    case BEACON_ERASE: beacon_stop(); result(CMD_BEACON, beacon_erase()); return;
+    case BEACON_START: beacon_stop(); result(CMD_BEACON, beacon_start()); return;
+    case BEACON_QUERY: beacon_query(); return;
+    default: result(CMD_BEACON, ESP_ERR_NOT_SUPPORTED);
+    }
+}
+static atomic_bool s_host_watched;    /* armed by CMD_ALIVE, disarmed by HELLO: an older host never sends it */
+
+static void command(uint8_t type, const uint8_t *p, size_t n)
+{
+    atomic_store(&s_host_seen, esp_timer_get_time());
+    wire_set_host_away(false);
+    if (atomic_load(&s_beacon_on) && (type == CMD_HELLO || type == CMD_CHANNEL || type == CMD_SNIFF ||
+                                      type == CMD_STA_JOIN || type == CMD_STOP || type == CMD_AP_START)) {
+        beacon_stop();
+        go_idle();
+    }
+    switch (type) {
+    case CMD_HELLO: atomic_store(&s_host_watched, false); wire_credit_reset(); display_reset(); send_info(); break;
+    case CMD_ALIVE: atomic_store(&s_host_watched, true); break;   /* no reply: it only keeps the watch fed */
+    case CMD_BAUD: {
+        uint32_t baud;
+        if (n != 4) { result(type, ESP_ERR_INVALID_SIZE); break; }
+        memcpy(&baud, p, 4);
+        result(type, 0);
+        wire_set_baud(baud);   /* queued behind the RESULT, which leaves at the old rate */
+        break;
+    }
+    case CMD_CHANNEL:
+        if (n != 1 || atomic_load(&s_mode) != MODE_IDLE) { result(type, ESP_ERR_INVALID_STATE); break; }
+        result(type, esp_wifi_set_channel(p[0], WIFI_SECOND_CHAN_NONE));
+        break;
+    case CMD_SNIFF:   /* u8 channel, 6 MAC */
+        if (n != 7) { result(type, ESP_ERR_INVALID_SIZE); break; }
+        go_idle();
+        memcpy(s_sniff_mac, p + 1, 6);
+        s_census = !memcmp(s_sniff_mac, "\xff\xff\xff\xff\xff\xff", 6);
+        {
+            const esp_err_t r = esp_wifi_set_channel(p[0], WIFI_SECOND_CHAN_NONE);
+            if (r == ESP_OK) { atomic_store(&s_mode, MODE_SNIFF); start_sniffer(); }
+            result(type, r);
+        }
+        break;
+    case CMD_STA_JOIN: result(type, sta_join(p, n)); break;
+    case CMD_STOP: go_idle(); result(type, 0); break;
+    case CMD_AP_START: result(type, ap_start(p, n)); break;
+    case CMD_AP_KICK: {
+        if (n != 8) { result(type, ESP_ERR_INVALID_SIZE); break; }
+        uint8_t mac[6];
+        uint16_t reason;
+        memcpy(mac, p, 6);
+        memcpy(&reason, p + 6, 2);
+        result(type, esp_wifi_ap_deauth_internal(mac, reason));
+        break;
+    }
+    case CMD_ETH_TX: {
+        static uint8_t frame[1600];
+        const enum mode mode = atomic_load(&s_mode);
+        int r = ESP_ERR_INVALID_STATE;
+        if ((mode == MODE_STA || mode == MODE_AP) && n >= 14 && n <= sizeof(frame)) {
+            memcpy(frame, p, n);
+            const int64_t started = esp_timer_get_time();
+            /* Published before the call: its TX-done can run on the other core before it returns. */
+            s_tx_handed[atomic_load(&s_tx_handed_head) % TX_RING] = (uint32_t)started;
+            atomic_fetch_add(&s_tx_handed_head, 1);
+            r = esp_wifi_internal_tx(current_interface(), frame, n);
+            /* A full driver queue is retried rather than dropped; a station that left gives 0x3015
+               at once. docs/hardware_esp32.md */
+            for (int tries = 0; r == ESP_ERR_NO_MEM && tries < 100; ++tries) {
+                if (tries == 0) atomic_fetch_add(&s_tx_eth_retried, 1);
+                vTaskDelay(1);
+                r = esp_wifi_internal_tx(current_interface(), frame, n);
+            }
+            const uint32_t took = esp_timer_get_time() - started;
+            if (took > atomic_load(&s_tx_eth_max_us)) atomic_store(&s_tx_eth_max_us, took);
+            atomic_fetch_add(&s_tx_eth_total_us, took);   /* wraps after 71 min */
+            if (took > 5000) atomic_fetch_add(&s_tx_eth_slow, 1);
+            if (r != ESP_OK) atomic_fetch_sub(&s_tx_handed_head, 1);   /* no TX-done will come */
+        }
+        if (r != ESP_OK) atomic_store(&s_tx_eth_last_err, r);
+        atomic_fetch_add(r == ESP_OK ? &s_tx_eth : &s_tx_eth_failed, 1);
+        break;
+    }
+    case CMD_RAW_TX: {
+        const int r = n >= 24 && n <= 1500 ? esp_wifi_80211_tx(current_interface(), p, n, true)
+                                           : ESP_ERR_INVALID_SIZE;
+        atomic_fetch_add(r == ESP_OK ? &s_tx_raw : &s_tx_raw_failed, 1);
+        break;
+    }
+    case CMD_STATUS: send_status(); break;
+    case CMD_BENCH: {
+        uint32_t *arg = malloc(8);
+        uint16_t size;
+        if (n != 6 || !arg) { free(arg); result(type, ESP_ERR_INVALID_SIZE); break; }
+        memcpy(&arg[0], p, 4);
+        memcpy(&size, p + 4, 2);
+        arg[1] = size;
+        if (size < 8 || size > WIRE_MAX_PAYLOAD) { free(arg); result(type, ESP_ERR_INVALID_ARG); break; }
+        result(type, 0);
+        xTaskCreatePinnedToCore(bench_task, "bench", 3072, arg, 5, NULL, 0);
+        break;
+    }
+    case CMD_LED: {   /* u8 pattern, u8 peak, u16 period ms, u16 duration ms */
+        uint16_t period, duration;
+        if (n != 6) { result(type, ESP_ERR_INVALID_SIZE); break; }
+        memcpy(&period, p + 2, 2);
+        memcpy(&duration, p + 4, 2);
+        result(type, led_set(p[0], p[1], period, duration) ? 0 : ESP_ERR_INVALID_ARG);
+        break;
+    }
+    case CMD_BEACON: beacon_command(p, n); break;
+    case CMD_DISPLAY:   /* scene.h; ESP_ERR_NOT_FOUND without a screen */
+        result(type, display_command(p, n) ? 0 : ESP_ERR_NOT_FOUND);
+        break;
+    default: result(type, ESP_ERR_NOT_SUPPORTED);
+    }
+}
+
+#if CONFIG_IDF_TARGET_ESP32C6
+/* XIAO ESP32C6: GPIO3 low powers the RF switch, GPIO14 low picks the ceramic antenna and high the
+   U.FL socket (Seeed's board guide). docs/hardware_esp32.md, Supported boards. */
+static void rf_switch_on(void)
+{
+    const gpio_config_t out = {.pin_bit_mask = (1ULL << 3) | (1ULL << 14), .mode = GPIO_MODE_OUTPUT};
+    gpio_config(&out);
+    gpio_set_level(3, 0);
+    gpio_set_level(14, 0);
+}
+#endif
+
+void app_main(void)
+{
+#if CONFIG_IDF_TARGET_ESP32C6
+    rf_switch_on();
+#endif
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        r = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(r);
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    const wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    s_ap_joins = xQueueCreate(8, 6);
+    install_hooks();
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    start_sniffer();
+#if POKELDN_BLE
+    ble_start();
+#endif
+    beacon_load();   /* before the wire answers: a host's first BEACON QUERY must see the stored image */
+    wire_start(command);
+    usbwatch_start();
+    led_start(led_state, button_pressed);
+    display_start(display_state);
+    send_info();
+    bool beacon_due = beacon_image() != NULL;
+
+    int64_t last_status = 0;
+    for (;;) {
+        if (atomic_load(&s_mode) == MODE_AP && esp_timer_get_time() - last_status > 2000000) {
+            last_status = esp_timer_get_time();
+            send_status();
+        }
+        uint8_t joined[6];
+        while (xQueueReceive(s_ap_joins, joined, 0) == pdTRUE) {
+            if (atomic_load(&s_mode) == MODE_AP) ap_open_station(joined);
+        }
+        if (beacon_due && esp_timer_get_time() > BEACON_GRACE_US) {
+            beacon_due = false;
+            if (!atomic_load(&s_host_seen)) {
+                wire_set_host_away(true);   /* no host reads the link: its messages go nowhere, no alarm */
+                beacon_start();
+            }
+        }
+        if (atomic_load(&s_host_watched) && atomic_load(&s_mode) != MODE_IDLE &&
+            esp_timer_get_time() - atomic_load(&s_host_seen) > HOST_SILENT_US) {
+            atomic_store(&s_host_watched, false);
+            if (!atomic_load(&s_beacon_on)) go_idle();   /* a beacon outlives its host */
+            wire_set_host_away(true);   /* its queue and what is heard next go nowhere: no alarm */
+        }
+        if (atomic_load(&s_mode) == MODE_STA_JOINING) {
+            if (atomic_load(&s_assoc_seen) && esp_wifi_sta_is_running_internal()) {
+                sta_install_keys();
+            } else if (esp_timer_get_time() - s_join_started > 15000000) {
+                go_idle();
+                sta_link(false, 0xffff);
+            }
+        }
+        vTaskDelay(1);
+    }
+}
