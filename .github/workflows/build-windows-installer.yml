@@ -2,7 +2,7 @@ name: Build portable Windows firmware installer
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, v1.0 ]
     tags: [ "v*" ]
 permissions:
   contents: write
@@ -50,6 +50,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+      - name: Embed Pocket Calm Windows application icon
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64
+          cd flasher
+          x86_64-w64-mingw32-windres -i icon.rc -o rsrc_windows_amd64.syso -O coff
       - name: Cross-compile portable Windows GUI
         env:
           GOOS: windows
@@ -58,12 +64,12 @@ jobs:
         run: |
           mkdir -p dist
           go build -trimpath -ldflags '-s -w -H windowsgui' \
-            -o dist/PokeLDN-PocketCalm-v0.8-Installer.exe ./flasher
+            -o dist/PokeLDN-PocketCalm-v1.0-Installer.exe ./flasher
       - name: Verify release EXE and merged image
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          exe = Path('dist/PokeLDN-PocketCalm-v0.8-Installer.exe').read_bytes()
+          exe = Path('dist/PokeLDN-PocketCalm-v1.0-Installer.exe').read_bytes()
           image = Path('flasher/assets/firmware-merged.bin').read_bytes()
           assert exe[:2] == b'MZ' and len(exe) > 1_000_000
           assert image[:1] == b'\xe9' and len(image) > 100_000
@@ -71,14 +77,14 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketCalm-v0.8-Windows-Installer
-          path: dist/PokeLDN-PocketCalm-v0.8-Installer.exe
+          name: PocketCalm-v1.0-Windows-Installer
+          path: dist/PokeLDN-PocketCalm-v1.0-Installer.exe
       - name: Publish GitHub Release on version tag
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/PokeLDN-PocketCalm-v0.8-Installer.exe \
+            dist/PokeLDN-PocketCalm-v1.0-Installer.exe \
             --title "PokéLDN Pocket Calm ${GITHUB_REF_NAME}" \
             --notes-file RELEASE_NOTES.md
