@@ -1,117 +1,113 @@
-# PokéLDN Pocket Calm — T-Dongle S3, v0.8 — Theme Switch Edition
+<div align="center">
 
-![Five themes available on the T-Dongle S3](themes_on_device_v08.png)
+<img src="assets/pocketcalm-icon.png" alt="Pocket Calm icon" width="104" height="104" />
 
-**Unofficial community firmware** for the **original LILYGO T-Dongle S3**, featuring its built-in **160×80 ST7735S screen**. Works with the existing PokéLDN Windows application; no modifications to its USB protocol are required.
+# PokéLDN Pocket Calm
 
-**Not affiliated with the PokéLDN developers, Nintendo, The Pokémon Company, LILYGO or Espressif.**
+**A tiny screen. A better trading experience.**
 
-## Download and install (Windows 10/11, x64)
+Custom display firmware and a one-file Windows installer for the **original LILYGO T-Dongle S3** (ESP32-S3 · 160 × 80 LCD).
 
-Download **`PokeLDN-PocketCalm-v0.8-Installer.exe`** from the [GitHub Releases](../../releases/latest) section (or from the workflow's **Artifacts** if a Release hasn't been published yet). Do not download the source ZIP if you just want to install the firmware.
+[![Release](https://img.shields.io/github/v/release/Arbusys/PokeLDN-PocketCalm?label=Latest%20release)](https://github.com/Arbusys/PokeLDN-PocketCalm/releases/latest)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
+![Windows](https://img.shields.io/badge/Installer-Windows%2010%2F11-142B46)
+![Board](https://img.shields.io/badge/Board-LILYGO%20T--Dongle%20S3-C84C4A)
 
-1. Connect the original **LILYGO T-Dongle S3** to your Windows PC.
-2. **Close PokéLDN** and other programs using the dongle's serial port.
-3. Open the EXE. Click **Detect ports**, or type the port seen under *Device Manager → Ports (COM & LPT)*.
-4. Check that the device is the correct board, then click **Install v0.8** and confirm.
-5. Do not disconnect USB or close the installer until it says **Firmware installed successfully!**.
-6. Unplug/reconnect the dongle and start PokéLDN again.
+### [Download for Windows](https://github.com/Arbusys/PokeLDN-PocketCalm/releases/latest) · [Installation guide](docs/INSTALLATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
-The installer automatically provides the full firmware and **Espressif esptool**. No Python, ESP-IDF or compiler is required for users. It does not require administrator privileges under normal USB driver configurations.
+*Unofficial community project. Not affiliated with or endorsed by the PokéLDN team, Nintendo, The Pokémon Company, LILYGO or Espressif.*
 
-**Important:** Flashing replaces whatever firmware is currently installed. The installer checks for an **ESP32-S3**, but cannot prove that the connected device is the specific LILYGO board: verify that yourself. Do not use on other ESP32-S3 boards with different GPIO wiring. The installer does not erase the entire flash chip, but may overwrite existing bootloader, partition table and app areas. Keep a backup of other custom firmware before installing.
+</div>
 
-### If no COM port is found
+---
 
-Install the relevant Windows USB driver if required, then look in **Device Manager → Ports**. If the ESP32-S3 does not respond, try holding the board's **BOOT** button while connecting to USB, then detect the new COM port. If PokéLDN is open, close it before flashing.
+## Your trades, on the dongle
 
-### Features
+Pocket Calm uses the T-Dongle S3's built-in colour screen to show PokéLDN activity without changing the existing Windows application. Watch **two large monochrome Pokémon silhouettes** and an animated **flying Poké Ball** during exchanges; see a confirmation when a Pokémon arrives.
 
-- **v0.7: hosted raid lobby screens**, using the existing PokéLDN `DISPLAY/LOBBY` and `DISPLAY/JOINED` messages. When the host provides a recognisable lobby title, the top bar displays **TERA RAID**, **MAX RAID**, **GMAX RAID** or **DYNAMAX ADV**; otherwise it safely displays **RAID LOBBY**.
-- Raid screen shows the **existing one-bit boss sprite**, full boss name (scrolls if too long), **star rating** (when provided), **guest count** and **Link Code** (when provided). Updates guest count in place.
-- **No changes to PokéLDN on Windows**: no new commands, USB messages, radio behaviour or LED behaviour. Raid UI appears **only if the stock application sends LOBBY**. If you see the home screen during a raid, the host may not have sent a screen event; the firmware cannot manufacture raid information.
-- Gigantamax cannot be distinguished from a normal Max Raid from the stock sprite metadata alone. `GMAX RAID` appears only when the supplied title actually includes Gigantamax/GMax. Likewise, Tera type, raid timer, lobby ready flags, victory and battle phases are **not** available through the stock screen messages.
+<div align="center">
+  <img src="assets/trade-animation.gif" alt="Animated trade sequence from Pocket Calm's firmware renderer" width="640" />
+  <br /><sub>Renderer preview — enlarged from the device's 160 × 80 display.</sub>
+</div>
 
-- Familiar handheld-inspired UI, in **English**.
-- High-contrast **monochrome Pokémon sprites** during trades, matching v0.1-style source pixels.
-- Two Pokémon appear at the sides with a **flying Poké Ball** animation at the center.
-- Softer APA102 LED: **slow cyan breath** during trades, **gentle green** after Pokémon reception, reduced brightness at idle.
-- Compatible with PokéLDN's existing radio/USB messages.
+## Five themes, one button
 
-## Building the Windows installer (for maintainers)
+<div align="center">
+<img src="assets/themes-on-device.png" alt="Classic, Modern Minimal, Game Boy Color, Crimson Ruby and Ocean Teal preview" width="650" />
+<br /><sub>Software-rendered previews. Actual LCD colours may vary.</sub>
+</div>
 
-This repository intentionally contains **no precompiled firmware**: GitHub Actions creates it from source. The build is reproducible in a CI environment, avoiding IDE setup for your community.
+| Theme | Character |
+|:--|:--|
+| **Classic** | Handheld-inspired navy, warm cream and red |
+| **Modern Minimal** | Restrained charcoal and turquoise |
+| **Game Boy Color** | Nostalgic green-toned palette |
+| **Crimson Ruby** | Deep wine and warm accents |
+| **Ocean Teal** | Cool blue-green with soft highlights |
 
-1. Push all files to a public GitHub repository (include `.github/workflows/build-windows-installer.yml`).
-2. Open **Actions → Build portable Windows firmware installer → Run workflow**. Pushing to `main` triggers it automatically too.
-3. Wait for the **build** job to succeed. Download the artifact `PocketCalm-v0.8-Windows-Installer` to obtain the complete `.exe`.
-4. To publish it under **Releases**, create a tag like `v0.8.0` and push it: the workflow also creates the release entry and attaches the EXE.
+Press the **rear BOOT button briefly after startup** to switch themes. Pocket Calm remembers your selection after unplugging the dongle. **Do not hold BOOT while connecting USB**, as that can enter ESP32 download mode.
 
-The CI job:
+## Raid lobbies, too
 
-- installs ESP-IDF **v6.1** with Espressif's official GitHub Action;
-- builds this repository's **ESP32-S3** firmware with `POKELDN_DISPLAY=T_DONGLE_S3`;
-- reads ESP-IDF's **actual `flasher_args.json`** to create one merged firmware file, including bootloader, partition table and app;
-- fetches **esptool 5.6.0** from Espressif's official release and embeds it with the firmware in a single native **Windows .exe**;
-- cross-compiles the installer using Go with **no third-party Go dependencies**;
-- uploads the Windows EXE as a downloadable artifact and, for version tags, a GitHub Release.
+<div align="center">
+<img src="assets/raid-lobbies.png" alt="Tera Raid and Max Raid lobby examples from firmware renderer" width="480" />
+<br /><sub>Illustrative test data, not live raid captures.</sub>
+</div>
 
-GitHub Actions builds and bundles the firmware and installer. The previous v0.7 has been validated by the project owner; **this new v0.8 build and theme switching need testing in GitHub Actions and on the real T-Dongle S3** before a public Release.
+The display supports hosted raid-lobby information **when the unmodified PokéLDN desktop application sends it**: available boss sprite and name, stars, guests and link code. Where the transmitted title identifies a format, the header can show **TERA RAID**, **MAX RAID**, **GMAX RAID** or **DYNAMAX ADV**. Otherwise it safely shows **RAID LOBBY**.
 
-### Firmware build from an ESP-IDF v6.1 terminal
+Pocket Calm does **not** invent untransmitted data such as Tera type, battle timers, victory state, or a Gigantamax form that the event does not distinguish.
 
-The original `build_tdongle_windows.ps1` is retained for firmware developers. To build/flash from an ESP-IDF PowerShell terminal:
+## A calmer, smarter indicator
 
-```powershell
-.\build_tdongle_windows.ps1
-.\build_tdongle_windows.ps1 -Port COM5 -Flash
-```
+- **Trades:** slower, softer cyan LED breathing effect.
+- **Received Pokémon:** gentle green confirmation.
+- **Idle:** dimmer LED and fewer unnecessary screen/LED updates.
+- **Themes:** saved locally on the device; no desktop configuration utility needed.
 
-### Installer build from source
+These optimisations reduce unnecessary activity, but actual temperature and power usage depend on the board and operating conditions.
 
-The installer lives at `flasher/main_windows.go`. It uses Go standard library Win32 calls. Assets under `flasher/assets/` are generated by the CI job. Do not attempt to distribute a locally compiled installer with placeholder assets: it will refuse to flash.
+## Install in minutes — no developer tools
 
-## Licensing and provenance
+<div align="center">
+<img src="assets/installer-v1.png" alt="Pocket Calm Windows installer interface" width="627" />
+<br /><sub>Installer screenshot from a hardware test.</sub>
+</div>
 
-The project's original firmware sources are based on the upstream [PokéLDN radio firmware](https://github.com/Decryptu/pokeldn) and use **AGPL-3.0**; the original text is in `LICENSE`. `vendor/zstd` retains its separate upstream licence in `vendor/zstd/LICENSE`. Espressif's `esptool` is bundled from an [official upstream release](https://github.com/espressif/esptool/releases) when CI runs; consult its licence and source repository. No Nintendo trademarks, artwork or logos are licensed or endorsed by the companies named above.
+1. Download **`PokeLDN-PocketCalm-v1.0-Installer.exe`** from [Releases](https://github.com/Arbusys/PokeLDN-PocketCalm/releases/latest) (open **Assets**).
+2. Plug in the **original T-Dongle S3 with the 160 × 80 display** using USB.
+3. **Close PokéLDN** and any serial tools. Open the installer.
+4. Check the automatically detected COM port and target board, then choose **INSTALL FIRMWARE**.
+5. Wait for **Firmware installed successfully!**; reconnect the dongle, then open PokéLDN.
 
-The firmware displays monochrome sprite data received from PokéLDN. This repository does not include a collection of proprietary Pokémon artwork.
+No ESP-IDF, Python, compiler or separate `esptool` installation is needed for end users. The `.exe` contains the required flashing components.
 
-## Theme lab (no flashing required)
+> [!CAUTION]
+> Flashing replaces firmware on the connected device. **Use only the original LILYGO T-Dongle S3 with the integrated 160 × 80 LCD.** Detection can recognise ESP32-S3 hardware but **cannot guarantee the exact board model**. Confirm the board before installing, and keep a backup of any firmware you want to preserve.
 
-Open `theme-lab.html` locally in any browser to compare **five palettes** across Home, Trade and Received screens: Classic v0.6, Modern Minimal, Game Boy Color, Crimson Ruby and Ocean Teal. These previews match the five selectable built-in firmware palettes. Actual hardware colours will depend on the LCD.
+Read the [step-by-step installation guide](docs/INSTALLATION.md) if you are new to ESP32 devices. If automatic detection fails, use [Troubleshooting](docs/TROUBLESHOOTING.md).
 
-## Rollback and compatibility
+## Compatibility
 
-The previously validated v0.7 should be retained as a rollback baseline. v0.8 adds five selectable palettes to the ESP32-S3 firmware, without changing the USB/radio protocol. Hardware tests remain necessary.
+| Component | Support |
+|:--|:--|
+| Hardware | Original **LILYGO T-Dongle S3**, integrated 160 × 80 LCD |
+| Host | **Windows 10/11**, 64-bit |
+| PokéLDN desktop | Existing Windows application; **no desktop patch required** |
+| Trade animations | Pokémon silhouettes, flying Poké Ball, arrival feedback |
+| Hosted raids | Existing PokéLDN `LOBBY` / `JOINED` display events, when sent |
+| Theme switch | Rear BOOT button; preference persists across power cycles |
 
-## Raid screen preview and regression checks
+**Test status:** the maintainer has exercised flashing, PokéLDN recognition, theme switching/persistence, and relevant display features on a real T-Dongle S3. Testing across other computers and hardware batches is welcome. This is not an official hardware certification.
 
-`raid_screens_v07.png` shows enlarged **actual 160×80 frames** generated from the firmware renderer with **synthetic test sprites** and example raid messages. They are demonstrations, not screenshots of the real games or live raid data.
+## Docs & development
 
-Developers with GCC and Pillow can re-run the preview and LOBBY/JOINED scenarios:
+- [Installation](docs/INSTALLATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Build from source / maintainer notes](docs/BUILDING.md)
+- [Project credits & licences](docs/CREDITS.md)
+- [Changelog](CHANGELOG.md) · [Release notes](RELEASE_NOTES.md)
+- Open `theme-lab.html` in your browser to explore palette mockups without flashing anything.
 
-```bash
-python3 tools/render_raid_previews.py
-```
+Pocket Calm is based on the [PokéLDN firmware project](https://github.com/Decryptu/pokeldn) and distributed under the [AGPL-3.0](LICENSE); component-specific third-party notices are preserved in the repository. Source for each release is available under the matching Git tag. Firmware and installer are provided **as is**, without warranty.
 
-The Classic theme renderer has been compared byte-for-byte against v0.7, using seven equivalent raid/trade test frames: all seven are identical. ESP-IDF compilation and hardware tests remain necessary.
-
-## What changes in v0.8
-
-No change to the PokéLDN desktop application or USB protocol. The original v0.7
-Classic trade screen is byte-for-byte identical (confirmed with native renderer tests),
-including the monochrome sprite bitmap, flying Poké Ball and raid information.
-Only the T-Dongle S3's colours are selectable from its rear BOOT button. To preview the actual renderer across Home, Trade and Raid, see `themes_on_device_v08.png`, generated from the C code.
-
-## NEW: Rear BOOT button theme switching (v0.8)
-
-While the device is powered up, briefly press the rear BOOT button (GPIO0) to cycle:
-**Classic → Modern Minimal → Game Boy Color → Crimson Ruby → Ocean Teal → Classic**.
-The currently selected theme is automatically saved in nonvolatile storage and
-restored when the dongle is reconnected. Each press displays a brief name label.
-Trade silhouettes use exactly the same source bitmap and nearest-neighbour scaling
-as v0.7. Raids, animations and PokéLDN Windows compatibility are unchanged.
-
-**Do not hold BOOT while connecting USB:** GPIO0 is an ESP32 boot strap pin and
-may cause the device to enter the flashing bootloader. Press only after boot.
+**Pocket Calm is not the PokéLDN application.** Get PokéLDN itself at [pokeldn.app](https://pokeldn.app/).
