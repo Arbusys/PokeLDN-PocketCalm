@@ -9,13 +9,13 @@ import (
 	"bytes"
 	"context"
 	"embed"
-	"strconv"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -62,57 +62,64 @@ const (
 )
 
 var (
-	user32           = syscall.NewLazyDLL("user32.dll")
-	kernel32         = syscall.NewLazyDLL("kernel32.dll")
-	gdi32            = syscall.NewLazyDLL("gdi32.dll")
-	registerClassEx  = user32.NewProc("RegisterClassExW")
-	createWindow     = user32.NewProc("CreateWindowExW")
-	defWindowProc    = user32.NewProc("DefWindowProcW")
-	getMessage       = user32.NewProc("GetMessageW")
-	translateMessage = user32.NewProc("TranslateMessage")
-	dispatchMessage  = user32.NewProc("DispatchMessageW")
-	showWindow       = user32.NewProc("ShowWindow")
-	updateWindow     = user32.NewProc("UpdateWindow")
-	messageBox       = user32.NewProc("MessageBoxW")
-	postQuitMessage  = user32.NewProc("PostQuitMessage")
-	sendMessage      = user32.NewProc("SendMessageW")
-	setWindowText    = user32.NewProc("SetWindowTextW")
-	getWindowText    = user32.NewProc("GetWindowTextW")
-	enableWindow     = user32.NewProc("EnableWindow")
-	setTimer         = user32.NewProc("SetTimer")
-	getModuleHandle  = kernel32.NewProc("GetModuleHandleW")
-	getStockObject   = gdi32.NewProc("GetStockObject")
+	user32             = syscall.NewLazyDLL("user32.dll")
+	kernel32           = syscall.NewLazyDLL("kernel32.dll")
+	gdi32              = syscall.NewLazyDLL("gdi32.dll")
+	registerClassEx    = user32.NewProc("RegisterClassExW")
+	createWindow       = user32.NewProc("CreateWindowExW")
+	defWindowProc      = user32.NewProc("DefWindowProcW")
+	getMessage         = user32.NewProc("GetMessageW")
+	translateMessage   = user32.NewProc("TranslateMessage")
+	dispatchMessage    = user32.NewProc("DispatchMessageW")
+	showWindow         = user32.NewProc("ShowWindow")
+	updateWindow       = user32.NewProc("UpdateWindow")
+	messageBox         = user32.NewProc("MessageBoxW")
+	postQuitMessage    = user32.NewProc("PostQuitMessage")
+	sendMessage        = user32.NewProc("SendMessageW")
+	setWindowText      = user32.NewProc("SetWindowTextW")
+	getWindowText      = user32.NewProc("GetWindowTextW")
+	enableWindow       = user32.NewProc("EnableWindow")
+	setTimer           = user32.NewProc("SetTimer")
+	getModuleHandle    = kernel32.NewProc("GetModuleHandleW")
+	getStockObject     = gdi32.NewProc("GetStockObject")
 	initCommonControls = syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls")
-	createFont       = gdi32.NewProc("CreateFontW")
-	createSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	deleteObject     = gdi32.NewProc("DeleteObject")
-	setBkMode        = gdi32.NewProc("SetBkMode")
-	setTextColor     = gdi32.NewProc("SetTextColor")
-	beginPaint       = user32.NewProc("BeginPaint")
-	endPaint         = user32.NewProc("EndPaint")
-	fillRect         = user32.NewProc("FillRect")
-	drawText         = user32.NewProc("DrawTextW")
+	createFont         = gdi32.NewProc("CreateFontW")
+	createSolidBrush   = gdi32.NewProc("CreateSolidBrush")
+	deleteObject       = gdi32.NewProc("DeleteObject")
+	setBkMode          = gdi32.NewProc("SetBkMode")
+	setTextColor       = gdi32.NewProc("SetTextColor")
+	beginPaint         = user32.NewProc("BeginPaint")
+	endPaint           = user32.NewProc("EndPaint")
+	fillRect           = user32.NewProc("FillRect")
+	drawText           = user32.NewProc("DrawTextW")
 
-	mainWindow uintptr
-	portBox    uintptr
-	logBox     uintptr
-	statusBox  uintptr
-	flashBtn   uintptr
-	refreshBtn uintptr
+	mainWindow  uintptr
+	portBox     uintptr
+	logBox      uintptr
+	statusBox   uintptr
+	flashBtn    uintptr
+	refreshBtn  uintptr
 	progressBar uintptr
-	fontBody uintptr
-	fontSmall uintptr
-	fontTitle uintptr
-	brushWhite uintptr
-	brushNavy uintptr
-	brushCream uintptr
-	guiEvents  = make(chan guiEvent, 256)
-	flashing   = false
-	logText    = ""
+	fontBody    uintptr
+	fontSmall   uintptr
+	fontTitle   uintptr
+	brushWhite  uintptr
+	brushNavy   uintptr
+	brushCream  uintptr
+	guiEvents   = make(chan guiEvent, 256)
+	flashing    = false
+	logText     = ""
 )
 
-type rect struct {Left, Top, Right, Bottom int32}
-type paintStruct struct {Hdc uintptr; Erase int32; RcPaint rect; Restore int32; IncUpdate int32; Reserved [32]byte}
+type rect struct{ Left, Top, Right, Bottom int32 }
+type paintStruct struct {
+	Hdc       uintptr
+	Erase     int32
+	RcPaint   rect
+	Restore   int32
+	IncUpdate int32
+	Reserved  [32]byte
+}
 
 type guiEvent struct {
 	kind string
@@ -156,7 +163,9 @@ func setText(hwnd uintptr, value string) {
 func makeCtrl(class, caption string, x, y, w, h int32, style uint32, id int) uintptr {
 	ret, _, _ := createWindow.Call(0, uintptr(unsafe.Pointer(ptr(class))), uintptr(unsafe.Pointer(ptr(caption))), uintptr(wsChild|wsVisible|style), uintptr(x), uintptr(y), uintptr(w), uintptr(h), mainWindow, uintptr(id), 0, 0)
 	font := fontBody
-	if font == 0 { font, _, _ = getStockObject.Call(defaultGuiFont) }
+	if font == 0 {
+		font, _, _ = getStockObject.Call(defaultGuiFont)
+	}
 	send(ret, wmSetFont, font, 1)
 	return ret
 }
@@ -212,7 +221,9 @@ func wndProc(hwnd uintptr, message uint32, wp, lp uintptr) uintptr {
 				case "status":
 					setText(statusBox, evt.msg)
 				case "progress":
-					if n, err := strconv.Atoi(evt.msg); err == nil { send(progressBar, pbmSetPos, uintptr(n), 0) }
+					if n, err := strconv.Atoi(evt.msg); err == nil {
+						send(progressBar, pbmSetPos, uintptr(n), 0)
+					}
 				case "log":
 					appendLog(evt.msg)
 				case "port":
@@ -222,7 +233,9 @@ func wndProc(hwnd uintptr, message uint32, wp, lp uintptr) uintptr {
 					enableWindow.Call(flashBtn, 1)
 					enableWindow.Call(refreshBtn, 1)
 					setText(statusBox, evt.msg)
-					if strings.Contains(evt.msg, "successfully") { send(progressBar,pbmSetPos,100,0) }
+					if strings.Contains(evt.msg, "successfully") {
+						send(progressBar, pbmSetPos, 100, 0)
+					}
 				}
 			default:
 				return 0
@@ -235,7 +248,9 @@ func wndProc(hwnd uintptr, message uint32, wp, lp uintptr) uintptr {
 func appendLog(s string) {
 	// esptool reports transfer progress as percentages on some releases.
 	for _, match := range regexp.MustCompile(`\b(\d{1,3})%`).FindAllStringSubmatch(s, -1) {
-		if n, err := strconv.Atoi(match[1]); err == nil && n <= 100 { send(progressBar, pbmSetPos, uintptr(10+n*85/100), 0) }
+		if n, err := strconv.Atoi(match[1]); err == nil && n <= 100 {
+			send(progressBar, pbmSetPos, uintptr(10+n*85/100), 0)
+		}
 	}
 	logText += s + "\r\n"
 	if len(logText) > 14000 {
@@ -257,37 +272,113 @@ var portRegex = regexp.MustCompile(`(?i)\bCOM[0-9]{1,3}\b`)
 
 func validPort(s string) bool { return portRegex.MatchString(s) && portRegex.FindString(s) == s }
 
+// serialCandidate keeps the Windows Device Manager identity together with its port.
+// COM numbers alone are not enough: COM1 is commonly a motherboard serial port.
+type serialCandidate struct {
+	port      string
+	name      string
+	pnpID     string
+	espUSB    bool
+	usbSerial bool
+}
+
+func parseSerialDevices(output string) []serialCandidate {
+	devices := map[string]serialCandidate{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "|", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		name, pnp := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
+		port := strings.ToUpper(portRegex.FindString(name))
+		if port == "" || !validPort(port) {
+			continue
+		}
+		upperID := strings.ToUpper(pnp)
+		upperName := strings.ToUpper(name)
+		// ESP32-S3 native USB usually enumerates with Espressif's VID 303A.
+		// Generic USB/UART bridges are also eligible if they are the ONLY USB serial device.
+		// They are *not* proof that the board is a T-Dongle S3.
+		esp := strings.Contains(upperID, "VID_303A")
+		usb := esp || strings.Contains(upperID, "USB\\VID_") ||
+			strings.Contains(upperID, "USBSTOR\\") ||
+			strings.Contains(upperName, "USB SERIAL") ||
+			strings.Contains(upperName, "USB-SERIAL") ||
+			strings.Contains(upperName, "SILICON LABS CP210")
+		candidate := serialCandidate{port: port, name: name, pnpID: pnp, espUSB: esp, usbSerial: usb}
+		// Deduplicate COM ports when a device appears more than once in the PnP listing.
+		if prev, ok := devices[port]; !ok || (!prev.espUSB && candidate.espUSB) || (!prev.usbSerial && candidate.usbSerial) {
+			devices[port] = candidate
+		}
+	}
+	out := make([]serialCandidate, 0, len(devices))
+	for _, d := range devices {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, _ := strconv.Atoi(strings.TrimPrefix(out[i].port, "COM"))
+		b, _ := strconv.Atoi(strings.TrimPrefix(out[j].port, "COM"))
+		return a < b
+	})
+	return out
+}
+
+func pickCandidate(devices []serialCandidate) (serialCandidate, string, bool) {
+	var esp, usb []serialCandidate
+	for _, d := range devices {
+		if d.espUSB {
+			esp = append(esp, d)
+		}
+		if d.usbSerial {
+			usb = append(usb, d)
+		}
+	}
+	if len(esp) == 1 {
+		return esp[0], "Espressif USB device", true
+	}
+	if len(esp) > 1 {
+		return serialCandidate{}, "Multiple Espressif USB devices found. Select the correct COM port manually.", false
+	}
+	if len(usb) == 1 {
+		return usb[0], "USB serial device (board not yet verified)", true
+	}
+	if len(usb) > 1 {
+		return serialCandidate{}, "Multiple USB serial devices found. Select the T-Dongle S3 port manually.", false
+	}
+	return serialCandidate{}, "No USB serial dongle detected. Connect it or enter its COM port manually.", false
+}
+
 func detectPorts() {
-	emit("status", "Detecting serial devices...")
-	// This is used only to suggest ports; users can still type a COM port.
-	script := `Get-CimInstance Win32_PnPEntity | Where-Object {$_.Name -match '\(COM[0-9]+\)'} | ForEach-Object { $_.Name }`
+	emit("status", "Looking for the T-Dongle S3...")
+	// Only connected, healthy Windows PnP ports. Include PNPDeviceID, so that
+	// built-in serial ports (such as COM1) are not confused with USB dongles.
+	script := `$ErrorActionPreference='Stop'; Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -eq 0 -and $_.Name -match '\(COM[0-9]+\)' } | ForEach-Object { ($_.Name -replace '[|\r\n]',' ') + '|' + ($_.PNPDeviceID -replace '[|\r\n]',' ') }`
 	c, cancel := context.WithTimeout(context.Background(), 14*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(c, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
 	if err != nil {
-		emit("status", "Enter the COM port shown in Windows Device Manager")
+		emit("status", "Device detection unavailable. Enter the COM port manually.")
+		emit("log", "Windows port enumeration failed: "+strings.TrimSpace(string(out)))
 		return
 	}
-	portsMap := map[string]bool{}
-	for _, match := range portRegex.FindAllString(string(out), -1) {
-		portsMap[strings.ToUpper(match)] = true
+	devices := parseSerialDevices(string(out))
+	for _, d := range devices {
+		emit("log", "Serial port found: "+d.port+" — "+d.name)
 	}
-	ports := []string{}
-	for s := range portsMap {
-		ports = append(ports, s)
+	candidate, reason, ok := pickCandidate(devices)
+	if !ok {
+		emit("status", reason)
+		return
 	}
-	sort.Strings(ports)
-	switch len(ports) {
-	case 0:
-		emit("status", "No serial ports found. Enter your COM port manually.")
-	case 1:
-		emit("port", ports[0])
-		emit("status", "Detected "+ports[0]+" — confirm in Device Manager")
-	default:
-		emit("status", "Detected "+strings.Join(ports, ", ")+". Enter the correct port above.")
-		emit("log", "Multiple ports detected: "+strings.Join(ports, ", "))
-	}
+	emit("port", candidate.port)
+	emit("status", "Selected "+candidate.port+" automatically — "+reason)
+	emit("log", "Auto-selected "+candidate.port+" ("+reason+"). ESP32-S3 chip will be verified before flashing.")
 }
+
 func getPort() string {
 	var buf [32]uint16
 	getWindowText.Call(portBox, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
@@ -415,53 +506,66 @@ func runTool(program string, args ...string) error {
 	return err
 }
 func makeFont(height, weight int32) uintptr {
-	font,_,_ := createFont.Call(uintptr(height),0,0,0,uintptr(weight),0,0,0,0,0,0,0,0,uintptr(unsafe.Pointer(ptr("Segoe UI"))))
+	font, _, _ := createFont.Call(uintptr(height), 0, 0, 0, uintptr(weight), 0, 0, 0, 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	return font
 }
-func rgb(r,g,b uint8) uintptr { return uintptr(uint32(r)|uint32(g)<<8|uint32(b)<<16) }
-func block(hdc uintptr, r rect, brush uintptr) { fillRect.Call(hdc,uintptr(unsafe.Pointer(&r)),brush) }
-func paintLabel(hdc uintptr, title string, x,y,w,h int32, font uintptr, color uintptr) {
-	setBkMode.Call(hdc,1); setTextColor.Call(hdc,color)
-	old,_,_ := gdi32.NewProc("SelectObject").Call(hdc,font)
-	r:=rect{x,y,x+w,y+h}
-	drawText.Call(hdc,uintptr(unsafe.Pointer(ptr(title))),^uintptr(0),uintptr(unsafe.Pointer(&r)),0)
-	gdi32.NewProc("SelectObject").Call(hdc,old)
+func rgb(r, g, b uint8) uintptr { return uintptr(uint32(r) | uint32(g)<<8 | uint32(b)<<16) }
+func block(hdc uintptr, r rect, brush uintptr) {
+	fillRect.Call(hdc, uintptr(unsafe.Pointer(&r)), brush)
+}
+func paintLabel(hdc uintptr, title string, x, y, w, h int32, font uintptr, color uintptr) {
+	setBkMode.Call(hdc, 1)
+	setTextColor.Call(hdc, color)
+	old, _, _ := gdi32.NewProc("SelectObject").Call(hdc, font)
+	r := rect{x, y, x + w, y + h}
+	drawText.Call(hdc, uintptr(unsafe.Pointer(ptr(title))), ^uintptr(0), uintptr(unsafe.Pointer(&r)), 0)
+	gdi32.NewProc("SelectObject").Call(hdc, old)
 }
 func paintBrand(hdc uintptr) {
-	block(hdc,rect{0,0,650,530},brushCream)
-	block(hdc,rect{0,0,650,133},brushNavy)
-	block(hdc,rect{0,127,650,133},createBrushTemporary(rgb(212,77,75)))
-	paintLabel(hdc,"POCKET CALM",26,21,520,45,fontTitle,rgb(243,233,208))
-	paintLabel(hdc,"FIRMWARE INSTALLER    •    v1.0",28,78,520,25,fontSmall,rgb(230,184,93))
-	paintLabel(hdc,"1   CONNECT YOUR T-DONGLE S3",27,152,575,24,fontSmall,rgb(20,43,70))
-	paintLabel(hdc,"2   INSTALL FIRMWARE",27,263,575,24,fontSmall,rgb(20,43,70))
+	block(hdc, rect{0, 0, 650, 530}, brushCream)
+	block(hdc, rect{0, 0, 650, 133}, brushNavy)
+	block(hdc, rect{0, 127, 650, 133}, createBrushTemporary(rgb(212, 77, 75)))
+	paintLabel(hdc, "POCKET CALM", 26, 21, 520, 45, fontTitle, rgb(243, 233, 208))
+	paintLabel(hdc, "FIRMWARE INSTALLER    •    v1.0", 28, 78, 520, 25, fontSmall, rgb(230, 184, 93))
+	paintLabel(hdc, "1   CONNECT YOUR T-DONGLE S3", 27, 152, 575, 24, fontSmall, rgb(20, 43, 70))
+	paintLabel(hdc, "2   INSTALL FIRMWARE", 27, 263, 575, 24, fontSmall, rgb(20, 43, 70))
 }
 func createBrushTemporary(c uintptr) uintptr {
 	// Persistent brushes for the window's lifetime; only used for the slim brand stripe.
-	if stripeBrush == 0 { stripeBrush,_,_ = createSolidBrush.Call(c) }
+	if stripeBrush == 0 {
+		stripeBrush, _, _ = createSolidBrush.Call(c)
+	}
 	return stripeBrush
 }
+
 var stripeBrush uintptr
+
 func main() {
 	runtime.LockOSThread()
 	initCommonControls.Call()
-	fontBody=makeFont(-17,400); fontSmall=makeFont(-16,600); fontTitle=makeFont(-37,700)
-	brushCream,_,_=createSolidBrush.Call(rgb(243,233,208))
-	brushNavy,_,_=createSolidBrush.Call(rgb(20,43,70))
-	brushWhite,_,_=createSolidBrush.Call(rgb(255,255,255))
+	fontBody = makeFont(-17, 400)
+	fontSmall = makeFont(-16, 600)
+	fontTitle = makeFont(-37, 700)
+	brushCream, _, _ = createSolidBrush.Call(rgb(243, 233, 208))
+	brushNavy, _, _ = createSolidBrush.Call(rgb(20, 43, 70))
+	brushWhite, _, _ = createSolidBrush.Call(rgb(255, 255, 255))
 	instance, _, _ := getModuleHandle.Call(0)
 	clsName := ptr("PokeldnPocketCalmInstaller")
 	cls := wndClassEx{Size: uint32(unsafe.Sizeof(wndClassEx{})), WndProc: syscall.NewCallback(wndProc), Instance: instance, Background: brushCream, ClassName: clsName}
-	if a, _, _ := registerClassEx.Call(uintptr(unsafe.Pointer(&cls))); a == 0 { return }
+	if a, _, _ := registerClassEx.Call(uintptr(unsafe.Pointer(&cls))); a == 0 {
+		return
+	}
 	hwnd, _, _ := createWindow.Call(0, uintptr(unsafe.Pointer(clsName)), uintptr(unsafe.Pointer(ptr("Pocket Calm — Firmware Installer v1.0"))), uintptr(wsOverlappedWindow&^0x00040000&^0x00010000), uintptr(240), uintptr(140), uintptr(650), uintptr(530), 0, 0, instance, 0)
-	if hwnd == 0 { return }
+	if hwnd == 0 {
+		return
+	}
 	mainWindow = hwnd
-	portBox = makeCtrl("EDIT", "COM5", 27, 188, 118, 35, wsBorder|wsTabStop, idPort)
+	portBox = makeCtrl("EDIT", "", 27, 188, 118, 35, wsBorder|wsTabStop, idPort)
 	refreshBtn = makeCtrl("BUTTON", "DETECT DEVICE", 163, 188, 188, 35, wsTabStop, idDetect)
 	flashBtn = makeCtrl("BUTTON", "INSTALL FIRMWARE", 366, 188, 240, 35, wsTabStop, idFlash)
-	makeCtrl("STATIC", "Only for the original LILYGO T-Dongle S3 (160 x 80 display)", 27, 229, 590, 23, 0, 0)
+	makeCtrl("STATIC", "Auto-detects USB device. Original T-Dongle S3 only (160 x 80 display)", 27, 229, 590, 23, 0, 0)
 	progressBar = makeCtrl("msctls_progress32", "", 27, 297, 578, 19, 0, 107)
-	statusBox = makeCtrl("STATIC", "Ready. Close PokéLDN before installing.", 27, 324, 587, 22, 0, idStatus)
+	statusBox = makeCtrl("STATIC", "Searching USB devices... Close PokéLDN before installing.", 27, 324, 587, 22, 0, idStatus)
 	makeCtrl("STATIC", "INSTALLATION LOG", 27, 355, 575, 24, 0, 0)
 	logBox = makeCtrl("EDIT", "", 27, 383, 578, 75, wsBorder|wsVScroll|esReadOnly|esMultiline|esAutoVScroll, idLog)
 	makeCtrl("STATIC", "Unofficial community project  •  AGPL-3.0  •  Windows 10/11", 27, 468, 580, 21, 0, 0)
@@ -472,7 +576,9 @@ func main() {
 	var msg msgStruct
 	for {
 		ret, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(ret) <= 0 { break }
+		if int32(ret) <= 0 {
+			break
+		}
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
