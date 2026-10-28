@@ -1,0 +1,5 @@
+Sur la branche v1.0, remplacer les 4 fichiers selon leurs chemins.
+Le fichier .github/workflows/build-windows-installer.yml peut etre edite avec le crayon GitHub.
+Le workflow genere le .exe final avec le firmware compile et son icone.
+Aucun fichier du firmware ESP32 n'est modifie par ce patch.
+Verifier la compilation GitHub Actions et tester l'executable avant publication publique.
