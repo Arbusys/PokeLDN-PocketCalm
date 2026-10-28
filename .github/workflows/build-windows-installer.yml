@@ -53,7 +53,7 @@ jobs:
       - name: Embed Pocket Calm Windows application icon
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq binutils-mingw-w64-x86-64
+          sudo apt-get install -y -qq binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64
           cd flasher
           x86_64-w64-mingw32-windres -i icon.rc -o rsrc_windows_amd64.syso -O coff
       - name: Cross-compile portable Windows GUI
