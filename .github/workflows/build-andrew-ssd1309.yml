@@ -1,0 +1,105 @@
+name: Build Andrew SSD1309 installer
+
+# Only the branch dedicated to Andrew can trigger this private test build.
+# The last workflow commit starts it automatically, even if workflow_dispatch
+# is not listed on the default branch in GitHub's Actions sidebar.
+on:
+  push:
+    branches:
+      - andrew-ssd1309
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      POKELDN_DISPLAY: XIAO_SSD1309
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Python for pixel preview tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check custom profile and generate simulated screen captures
+        run: |
+          test -f firmware/esp32/main/panel_xiao_ssd1309.c
+          test -f firmware/esp32/main/pocket_oled_render.c
+          python -m pip install --disable-pip-version-check Pillow
+          python tools/render_oled_previews.py
+
+      - name: Set up ESP-IDF v6.1
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: 'v6.1'
+
+      - name: Compile XIAO ESP32-S3 + SSD1309 firmware
+        run: |
+          idf.py -C firmware/esp32 set-target esp32s3
+          idf.py -C firmware/esp32 build
+
+      - name: Merge ESP-IDF bootloader, partition table and app
+        run: python3 tools/merge_firmware.py
+
+      - name: Fetch official Windows esptool
+        run: |
+          curl -fL --retry 3 -o /tmp/esptool.zip \
+            https://github.com/espressif/esptool/releases/download/v5.6.0/esptool-v5.6.0-windows-amd64.zip
+          python3 - <<'PYEX'
+          from pathlib import Path
+          import zipfile
+          with zipfile.ZipFile('/tmp/esptool.zip') as z:
+              matches=[n for n in z.namelist() if n.lower().endswith('/esptool.exe') or n.lower()=='esptool.exe']
+              assert len(matches)==1, matches
+              data=z.read(matches[0])
+              assert data[:2]==b'MZ' and len(data)>100_000
+              Path('flasher/assets/esptool.exe').write_bytes(data)
+          PYEX
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Compile Windows installer icon
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-mingw-w64-x86-64
+          cd flasher
+          x86_64-w64-mingw32-windres -i icon.rc -o rsrc_windows_amd64.syso -O coff
+
+      - name: Compile experimental Windows installer
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags '-s -w -H windowsgui' \
+            -o dist/PocketCalm-Andrew-SSD1309-TEST.exe ./flasher
+
+      - name: Validate output headers
+        run: |
+          python3 - <<'PYEX'
+          from pathlib import Path
+          exe=Path('dist/PocketCalm-Andrew-SSD1309-TEST.exe').read_bytes()
+          firmware=Path('flasher/assets/firmware-merged.bin').read_bytes()
+          assert exe[:2] == b'MZ' and len(exe)>1_000_000
+          assert firmware[0]==0xE9 and len(firmware)>100_000
+          print('EXE and ESP32-S3 merged image are structurally valid')
+          PYEX
+
+      - name: Upload installer and pixel-perfect screen previews
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketCalm-Andrew-SSD1309-Test
+          path: |
+            dist/PocketCalm-Andrew-SSD1309-TEST.exe
+            previews/oled128/*.png
+            previews/oled128/*.gif
+          retention-days: 14
