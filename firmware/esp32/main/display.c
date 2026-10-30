@@ -10,6 +10,9 @@
 #include "led.h"
 #include "panel.h"
 #include "screen.h"
+#if defined(POKELDN_DISPLAY_XIAO_SSD1309)
+#include "pocket_oled_render.h"
+#endif
 
 #define FRAME_MS 50
 
@@ -42,6 +45,13 @@ static void display_task(void *arg)
         scene_visual(&visual, now);
         led_scene_update(visual.show, visual.elapsed_ms, visual.reveal_ms);
 #endif
+#if defined(POKELDN_DISPLAY_XIAO_SSD1309)
+        /* Render native Pocket Calm monochrome scenes after upstream protocol
+           processing, without changing any PokéLDN packets or radio logic. */
+        scene_visual_t oled_visual;
+        scene_visual(&oled_visual, now);
+        pocket_oled_render(s_frame, &state, &oled_visual, now);
+#endif
         /* The frame goes before the panel lights, so waking never shows the last one. */
         if (power != SCENE_OFF) panel_present(s_frame);
         if (power != s_power && panel_power(power))
@@ -55,7 +65,13 @@ bool display_start(display_state_t state)
     if (!panel_init()) return false;
     s_state = state;
     s_commands = xQueueCreate(8, sizeof(display_msg_t));
-    xTaskCreatePinnedToCore(display_task, "display", 3072, NULL, 1, NULL, configNUMBER_OF_CORES - 1);
+#ifdef POKELDN_DISPLAY_XIAO_SSD1309
+    /* Extra stack space for custom scene rendering on the XIAO profile. */
+    const uint32_t display_stack = 4096;
+#else
+    const uint32_t display_stack = 3072;
+#endif
+    xTaskCreatePinnedToCore(display_task, "display", display_stack, NULL, 1, NULL, configNUMBER_OF_CORES - 1);
     return true;
 }
 
